@@ -1,8 +1,8 @@
 /**
  * @name ReadAllNotificationsButtonv2
  * @author uwemanfred64-png
- * @description Adds a "read all" button to the server list that marks every notification as read at once, and a button to the mentions popout that clears all mentions. Includes a counter, Shift+click to read everything, middle click for the current server, a keybind, folders in the context menu, a server black list, timed and automatic reading and 30 selectable languages. No library needed.
- * @version 2.0.0
+ * @description Adds a "read all" button to the server list that marks every notification as read at once, and a button to the mentions popout that clears all mentions. Includes a counter, Shift+click to read everything, middle click for the current server, a keybind, folders in the context menu, a server black list, timed and automatic reading, reading only older messages, keeping channels with mentions unread, excluded channels and 30 selectable languages. No library needed.
+ * @version 2.1.0
  * @source https://github.com/uwemanfred64-png/ReadAllNotificationsButtonv2
  * @website https://github.com/uwemanfred64-png/ReadAllNotificationsButtonv2
  * @updateUrl https://raw.githubusercontent.com/uwemanfred64-png/ReadAllNotificationsButtonv2/main/ReadAllNotificationsButtonv2.plugin.js
@@ -18,13 +18,17 @@ const FOLDER_NAME_LENGTH = 40;
 const DISCORD_EPOCH = 1420070400000n;
 const MENTIONS_TAB = 1;
 const MINUTE = 60000;
+const HOUR = 60 * MINUTE;
+const OLDER_THAN = [0, 1, 6, 24];
+const TOOLTIP_NAMES = 5;
+const PARENT_DEPTH = 3;
 const INTERVALS = [0, 5, 15, 30, 60];
 const MIDDLE_BUTTON = 1;
 
 const defaults = {
     general: { language: "auto", addClearButton: true, confirmClear: false },
     batch: { guilds: true, muted: false, dms: false },
-    extras: { label: "read all", badgeMode: "mentions", hideWhenEmpty: false, toast: true, autoMuted: false, readOnStart: false, interval: 0, hotkey: [] },
+    extras: { label: "read all", badgeMode: "mentions", olderThan: 0, keepMentions: false, hideWhenEmpty: false, toast: true, autoMuted: false, readOnStart: false, interval: 0, hotkey: [] },
 };
 
 const modifiers = { Control: "ctrlKey", Shift: "shiftKey", Alt: "altKey", Meta: "metaKey" };
@@ -63,8 +67,8 @@ function classMap(Webpack, ...names) {
     return module ? Object.fromEntries(names.map(name => [name, find(module, name)])) : null;
 }
 
-function snowflakeNow() {
-    return String((BigInt(Date.now()) - DISCORD_EPOCH) << 22n);
+function snowflakeAt(time) {
+    return String((BigInt(Math.floor(time)) - DISCORD_EPOCH) << 22n);
 }
 
 function matchesHotkey(event, combo) {
@@ -161,6 +165,8 @@ module.exports = class ReadAllNotificationsButtonv2 {
             group,
             Object.fromEntries(Object.entries(values).map(([key, value]) => [key, saved[group]?.[key] ?? value])),
         ]));
+        const channelBlacklist = Data.load("channelBlacklist");
+        this.channelBlacklist = Array.isArray(channelBlacklist) ? channelBlacklist : [];
         const blacklist = Data.load("blacklist");
         this.blacklist = Array.isArray(blacklist) ? blacklist : [];
 
@@ -169,7 +175,11 @@ module.exports = class ReadAllNotificationsButtonv2 {
         for (const s of [GuildReadState, ReadState, this.stores.RecentMentions]) s?.addChangeListener(this.refresh);
         window.addEventListener("keydown", this.onKeyDown, true);
         this.dispatcher?.subscribe("MESSAGE_CREATE", this.onMessage);
-        this.unpatchGuildMenu = this.api.ContextMenu.patch?.("guild-context", (tree, props) => this.extendGuildMenu(tree, props));
+        this.unpatchMenus = [
+            this.api.ContextMenu.patch?.("guild-context", (tree, props) => this.extendGuildMenu(tree, props)),
+            this.api.ContextMenu.patch?.("channel-context", (tree, props) => this.extendChannelMenu(tree, props)),
+            this.api.ContextMenu.patch?.("thread-context", (tree, props) => this.extendChannelMenu(tree, props)),
+        ].filter(Boolean);
 
         this.sync();
         this.setupInterval();
@@ -181,8 +191,8 @@ module.exports = class ReadAllNotificationsButtonv2 {
         for (const s of [this.stores?.GuildReadState, this.stores?.ReadState, this.stores?.RecentMentions]) s?.removeChangeListener(this.refresh);
         window.removeEventListener("keydown", this.onKeyDown, true);
         this.dispatcher?.unsubscribe("MESSAGE_CREATE", this.onMessage);
-        this.unpatchGuildMenu?.();
-        this.unpatchGuildMenu = null;
+        for (const unpatch of this.unpatchMenus ?? []) unpatch();
+        this.unpatchMenus = null;
         clearInterval(this.intervalTimer);
         this.intervalTimer = null;
         this.api.DOM.removeStyle("main");
@@ -267,9 +277,17 @@ module.exports = class ReadAllNotificationsButtonv2 {
 
     updateTooltip() {
         if (!this.tooltip?.labelElement || !this.settings) return;
-        const dms = this.unreadDMs().length;
+        const { Guild, GuildReadState } = this.stores;
         const t = this.t;
-        this.tooltip.labelElement.textContent = `${format(t.tooltip_button, { servers: this.unreadGuilds().length, dms })}\n${t.tooltip_middle}`;
+        const unread = this.unreadGuilds();
+        const names = unread.slice(0, TOOLTIP_NAMES).map(id => {
+            const mentions = GuildReadState.getMentionCount(id);
+            return `${Guild.getGuild(id)?.name ?? id}${mentions ? ` (${mentions})` : ""}`;
+        });
+        if (unread.length > TOOLTIP_NAMES) names.push(format(t.tooltip_more, { n: unread.length - TOOLTIP_NAMES }));
+        const [head, ...hints] = format(t.tooltip_button, { servers: unread.length, dms: this.unreadDMs().length }).split("\n");
+        const lines = [head, ...(names.length ? [names.join(", ")] : []), ...hints, t.tooltip_middle];
+        this.tooltip.labelElement.textContent = lines.join("\n");
     }
 
     refresh() {
@@ -335,6 +353,28 @@ module.exports = class ReadAllNotificationsButtonv2 {
             }],
         });
         tree.props.children = [tree.props.children, group].flat();
+    }
+
+    extendChannelMenu(tree, props) {
+        const id = props?.channel?.id;
+        if (!id || !this.settings || !tree?.props) return;
+        const group = this.api.ContextMenu.buildItem({
+            type: "group",
+            items: [{
+                type: "toggle",
+                id: "ranb-channel-blacklist",
+                label: this.t.context_blacklist,
+                checked: this.channelBlacklist.includes(id),
+                action: () => this.saveChannelBlacklist(this.channelBlacklist.includes(id) ? this.channelBlacklist.filter(c => c !== id) : [...this.channelBlacklist, id]),
+            }],
+        });
+        tree.props.children = [tree.props.children, group].flat();
+    }
+
+    saveChannelBlacklist(list) {
+        this.channelBlacklist = [...new Set(list)];
+        this.api.Data.save("channelBlacklist", this.channelBlacklist);
+        this.refresh();
     }
 
     readEverything() {
@@ -465,13 +505,43 @@ module.exports = class ReadAllNotificationsButtonv2 {
         return this.allGuilds().some(id => this.isUnread(id));
     }
 
-    fallbackAcks(guildId) {
+    cutoff() {
+        const hours = Number(this.settings?.extras.olderThan) || 0;
+        return hours > 0 ? snowflakeAt(Date.now() - hours * HOUR) : null;
+    }
+
+    skipsChannel(id, cutoff) {
+        if (cutoff || this.settings.extras.keepMentions) return this.stores.ReadState.getMentionCount(id) > 0;
+        return false;
+    }
+
+    isExcludedChannel(id) {
+        let channel = this.stores.Channel.getChannel(id);
+        for (let depth = 0; depth < PARENT_DEPTH && id; depth++) {
+            if (this.channelBlacklist.includes(id)) return true;
+            id = channel?.parent_id;
+            channel = id ? this.stores.Channel.getChannel(id) : null;
+        }
+        return false;
+    }
+
+    needsChannelAcks(guildId) {
+        if (this.cutoff() || this.settings.extras.keepMentions) return true;
+        return this.channelBlacklist.length > 0 && this.channelIds(guildId).some(id => this.isExcludedChannel(id));
+    }
+
+    channelAcks(guildId) {
         const { Channel, ReadState } = this.stores;
         const { CHANNEL, GUILD_EVENT } = this.readStateTypes;
-        const acks = this.channelIds(guildId)
-            .filter(id => this.channelUnread(id))
-            .map(id => ({ channelId: id, readStateType: CHANNEL, messageId: Channel.getChannel(id)?.isForumLikeChannel?.() ? snowflakeNow() : ReadState.lastMessageId(id) }));
-        const eventId = ReadState.lastMessageId(guildId, GUILD_EVENT);
+        const cutoff = this.cutoff();
+        const acks = [];
+        for (const id of this.channelIds(guildId)) {
+            if (!this.channelUnread(id) || this.isExcludedChannel(id) || this.skipsChannel(id, cutoff)) continue;
+            let messageId = Channel.getChannel(id)?.isForumLikeChannel?.() ? snowflakeAt(Date.now()) : ReadState.lastMessageId(id);
+            if (cutoff && messageId && BigInt(messageId) > BigInt(cutoff)) messageId = cutoff;
+            if (messageId) acks.push({ channelId: id, readStateType: CHANNEL, messageId });
+        }
+        const eventId = cutoff ? null : ReadState.lastMessageId(guildId, GUILD_EVENT);
         if (eventId) acks.push({ channelId: guildId, readStateType: GUILD_EVENT, messageId: eventId });
         return acks;
     }
@@ -481,21 +551,38 @@ module.exports = class ReadAllNotificationsButtonv2 {
         const ids = [...new Set(guildIds)].filter(id => id && !this.blacklist.includes(id) && Guild.getGuild(id) && this.guildHasUnread(id));
         if (!ids.length) return 0;
 
-        try {
-            if (!this.markGuildsRead) throw new Error("markGuildsRead missing");
-            this.markGuildsRead(ids);
-        } catch (err) {
-            if (this.markGuildsRead) console.error("[ReadAllNotificationsButtonv2]", err);
-            const acks = ids.flatMap(id => this.fallbackAcks(id));
-            for (let i = 0; i < acks.length; i += ACK_CHUNK) this.bulkAck?.(acks.slice(i, i + ACK_CHUNK));
+        const precise = ids.filter(id => !this.markGuildsRead || this.needsChannelAcks(id));
+        const whole = ids.filter(id => !precise.includes(id));
+        if (whole.length) {
+            try {
+                this.markGuildsRead(whole);
+            } catch (err) {
+                console.error("[ReadAllNotificationsButtonv2]", err);
+                precise.push(...whole);
+                whole.length = 0;
+            }
         }
-        return ids.length;
+
+        let touched = whole.length;
+        const acks = [];
+        for (const id of precise) {
+            const guildAcks = this.channelAcks(id);
+            if (guildAcks.some(a => a.readStateType === this.readStateTypes.CHANNEL)) touched++;
+            acks.push(...guildAcks);
+        }
+        for (let i = 0; i < acks.length; i += ACK_CHUNK) this.bulkAck?.(acks.slice(i, i + ACK_CHUNK));
+        return touched;
     }
 
     readDMs(channelIds) {
         if (!this.ack) return 0;
-        const unread = channelIds.filter(id => this.channelUnread(id));
-        unread.forEach((id, i) => this.later(() => this.ack(id), i * DM_DELAY));
+        const cutoff = this.cutoff();
+        const unread = channelIds.filter(id => this.channelUnread(id) && !this.isExcludedChannel(id) && !this.skipsChannel(id, cutoff));
+        unread.forEach((id, i) => this.later(() => {
+            const last = this.stores.ReadState.lastMessageId(id);
+            const messageId = cutoff && last && BigInt(last) > BigInt(cutoff) ? cutoff : undefined;
+            this.ack(id, undefined, false, false, messageId);
+        }, i * DM_DELAY));
         return unread.length;
     }
 
@@ -640,6 +727,15 @@ module.exports = class ReadAllNotificationsButtonv2 {
                 category("extras", [
                     { type: "text", id: "label", name: t.set_label, value: extras.label, placeholder: defaults.extras.label },
                     { type: "dropdown", id: "badgeMode", name: t.set_badgeMode, value: extras.badgeMode, options: ["mentions", "unread", "off"].map(value => ({ label: t[`badge_${value}`], value })) },
+                    {
+                        type: "dropdown",
+                        id: "olderThan",
+                        name: t.set_olderThan,
+                        note: t.note_olderThan,
+                        value: extras.olderThan,
+                        options: OLDER_THAN.map(value => ({ label: value ? format(t.olderThan_hours, { n: value }) : t.olderThan_off, value })),
+                    },
+                    toggle(extras, "keepMentions"),
                     toggle(extras, "hideWhenEmpty"),
                     toggle(extras, "toast"),
                     toggle(extras, "autoMuted", t.note_autoMuted),
@@ -655,6 +751,7 @@ module.exports = class ReadAllNotificationsButtonv2 {
                 ]),
                 category("blacklist", [
                     { type: "custom", id: "guilds", name: "", note: t.blacklist_note, inline: false, children: React.createElement(GuildList, { plugin: this }) },
+                    { type: "custom", id: "channels", name: t.channels_excluded, inline: false, children: React.createElement(ChannelList, { plugin: this }) },
                 ], false),
             ],
             onChange: (group, id, value) => {
@@ -688,7 +785,7 @@ ${controls ? `.${controls} { display: flex; align-items: center; gap: 8px; }` : 
 .ranb-button { box-sizing: border-box; padding: 0 4px; border-radius: 4px; font-size: 12px; line-height: 1.3; white-space: nowrap; cursor: pointer; }
 .ranb-plain { display: flex; justify-content: center; width: 100%; margin-bottom: 8px; }
 .ranb-plain .ranb-button { display: flex; align-items: center; justify-content: center; width: 100%; background: var(--background-base-low, #313338); color: var(--text-default, #dbdee1); }
-.ranb-badge { position: absolute; top: -8px; right: calc(50% - var(--guildbar-avatar-size) / 2 - 10px); min-width: 16px; height: 16px; padding: 0 4px; box-sizing: border-box; border-radius: 8px; background: var(--status-danger, #f23f43); color: #fff; font-size: 12px; font-weight: 700; line-height: 16px; text-align: center; pointer-events: none; box-shadow: 0 0 0 3px var(--background-base-lowest, #1e1f22); }
+.ranb-badge { position: absolute; top: -10px; right: calc(50% - var(--guildbar-avatar-size) / 2 - 10px); min-width: 16px; height: 16px; padding: 0 4px; box-sizing: border-box; border-radius: 8px; background: var(--status-danger, #f23f43); color: #fff; font-size: 12px; font-weight: 700; line-height: 16px; text-align: center; pointer-events: none; box-shadow: 0 0 0 3px var(--background-base-lowest, #1e1f22); }
 .ranb-badge[hidden] { display: none; }
 .ranb-badge-unread { background: var(--background-mod-strong, #4e5058); }
 .ranb-clear { flex-shrink: 0; }
@@ -699,10 +796,33 @@ ${controls ? `.${controls} { display: flex; align-items: center; gap: 8px; }` : 
 .ranb-guild img { width: 100%; height: 100%; object-fit: cover; }
 .ranb-guild.ranb-off { opacity: 0.3; filter: grayscale(1); }
 .ranb-guild-actions { display: flex; flex-direction: column; gap: 8px; }
+.ranb-channels { color: var(--text-muted, #949ba4); }
 .ranb-guild-action { display: flex; align-items: center; justify-content: space-between; gap: 16px; color: var(--text-default, #dbdee1); font-size: 14px; }
 `;
     }
 };
+
+function ChannelList({ plugin }) {
+    const { React, Components } = BdApi;
+    const [list, setList] = React.useState(plugin.channelBlacklist);
+    const t = plugin.t;
+    const { Channel, Guild } = plugin.stores;
+    const names = list.map(id => {
+        const channel = Channel.getChannel(id);
+        const guild = channel?.guild_id ? Guild.getGuild(channel.guild_id) : null;
+        return channel ? `#${channel.name}${guild ? ` (${guild.name})` : ""}` : id;
+    });
+    const clear = () => {
+        plugin.saveChannelBlacklist([]);
+        setList([]);
+    };
+    const Button = Components?.Button;
+
+    return React.createElement("div", { className: "ranb-guild-action" },
+        React.createElement("span", { className: "ranb-channels" }, names.length ? names.join(", ") : t.channels_none),
+        names.length ? (Button ? React.createElement(Button, { color: Button.Colors?.PRIMARY, onClick: clear }, t.button_clear) : React.createElement("button", { onClick: clear }, t.button_clear)) : null
+    );
+}
 
 function GuildList({ plugin }) {
     const { React, Components } = BdApi;
@@ -840,6 +960,15 @@ const labels = {
         interval_minutes: "{n} minutes",
         context_blacklist: "Exclude from read all",
         tooltip_middle: "Middle click marks only the current server as read",
+        set_olderThan: "Only mark messages as read that are older than",
+        note_olderThan: "Newer messages stay unread. Channels with mentions always stay unread in this mode.",
+        olderThan_off: "All messages",
+        olderThan_hours: "{n} h",
+        set_keepMentions: "Keep channels with mentions unread",
+        channels_excluded: "Excluded channels (right click a channel to add)",
+        channels_none: "None",
+        button_clear: "Remove all",
+        tooltip_more: "+{n} more",
     },
     de: {
         context_unreadguilds: "Ungelesene Server",
@@ -895,6 +1024,15 @@ const labels = {
         interval_minutes: "{n} Minuten",
         context_blacklist: "Von read all ausnehmen",
         tooltip_middle: "Mittelklick markiert nur den aktuellen Server als gelesen",
+        set_olderThan: "Nur Nachrichten als gelesen markieren, die älter sind als",
+        note_olderThan: "Neuere Nachrichten bleiben ungelesen. Kanäle mit Erwähnungen bleiben in diesem Modus immer ungelesen.",
+        olderThan_off: "Alle Nachrichten",
+        olderThan_hours: "{n} Std.",
+        set_keepMentions: "Kanäle mit Erwähnungen ungelesen lassen",
+        channels_excluded: "Ausgenommene Kanäle (Rechtsklick auf einen Kanal zum Hinzufügen)",
+        channels_none: "Keine",
+        button_clear: "Alle entfernen",
+        tooltip_more: "+{n} weitere",
     },
     bg: {
         context_unreadguilds: "Непрочетени сървъри",
@@ -950,6 +1088,15 @@ const labels = {
         interval_minutes: "{n} минути",
         context_blacklist: "Изключи от read all",
         tooltip_middle: "Среден клик отбелязва само текущия сървър като прочетен",
+        set_olderThan: "Отбелязване като прочетени само на съобщения, по-стари от",
+        note_olderThan: "По-новите съобщения остават непрочетени. Каналите със споменавания винаги остават непрочетени в този режим.",
+        olderThan_off: "Всички съобщения",
+        olderThan_hours: "{n} ч",
+        set_keepMentions: "Каналите със споменавания остават непрочетени",
+        channels_excluded: "Изключени канали (десен клик върху канал за добавяне)",
+        channels_none: "Няма",
+        button_clear: "Премахни всички",
+        tooltip_more: "+{n} още",
     },
     cs: {
         context_unreadguilds: "Nepřečtené servery",
@@ -1005,6 +1152,15 @@ const labels = {
         interval_minutes: "{n} minut",
         context_blacklist: "Vyřadit z read all",
         tooltip_middle: "Prostřední tlačítko označí jen aktuální server jako přečtený",
+        set_olderThan: "Označit jako přečtené jen zprávy starší než",
+        note_olderThan: "Novější zprávy zůstanou nepřečtené. Kanály se zmínkami v tomto režimu vždy zůstanou nepřečtené.",
+        olderThan_off: "Všechny zprávy",
+        olderThan_hours: "{n} h",
+        set_keepMentions: "Kanály se zmínkami nechat nepřečtené",
+        channels_excluded: "Vyřazené kanály (přidáš pravým kliknutím na kanál)",
+        channels_none: "Žádné",
+        button_clear: "Odebrat vše",
+        tooltip_more: "+{n} dalších",
     },
     da: {
         context_unreadguilds: "Ulæste servere",
@@ -1060,6 +1216,15 @@ const labels = {
         interval_minutes: "{n} minutter",
         context_blacklist: "Udeluk fra read all",
         tooltip_middle: "Midterklik markerer kun den nuværende server som læst",
+        set_olderThan: "Markér kun beskeder som læst, der er ældre end",
+        note_olderThan: "Nyere beskeder forbliver ulæste. Kanaler med omtaler forbliver altid ulæste i denne tilstand.",
+        olderThan_off: "Alle beskeder",
+        olderThan_hours: "{n} t",
+        set_keepMentions: "Lad kanaler med omtaler forblive ulæste",
+        channels_excluded: "Udelukkede kanaler (højreklik på en kanal for at tilføje)",
+        channels_none: "Ingen",
+        button_clear: "Fjern alle",
+        tooltip_more: "+{n} mere",
     },
     el: {
         context_unreadguilds: "Μη αναγνωσμένοι διακομιστές",
@@ -1115,6 +1280,15 @@ const labels = {
         interval_minutes: "{n} λεπτά",
         context_blacklist: "Εξαίρεση από το read all",
         tooltip_middle: "Το μεσαίο κλικ επισημαίνει μόνο τον τρέχοντα διακομιστή ως αναγνωσμένο",
+        set_olderThan: "Επισήμανση ως αναγνωσμένα μόνο μηνυμάτων παλαιότερων από",
+        note_olderThan: "Τα νεότερα μηνύματα μένουν μη αναγνωσμένα. Τα κανάλια με αναφορές μένουν πάντα μη αναγνωσμένα σε αυτή τη λειτουργία.",
+        olderThan_off: "Όλα τα μηνύματα",
+        olderThan_hours: "{n} ώρ.",
+        set_keepMentions: "Τα κανάλια με αναφορές μένουν μη αναγνωσμένα",
+        channels_excluded: "Εξαιρεμένα κανάλια (δεξί κλικ σε κανάλι για προσθήκη)",
+        channels_none: "Κανένα",
+        button_clear: "Αφαίρεση όλων",
+        tooltip_more: "+{n} ακόμη",
     },
     es: {
         context_unreadguilds: "Servidores no leídos",
@@ -1170,6 +1344,15 @@ const labels = {
         interval_minutes: "{n} minutos",
         context_blacklist: "Excluir de read all",
         tooltip_middle: "El clic central marca como leído solo el servidor actual",
+        set_olderThan: "Marcar como leídos solo los mensajes más antiguos de",
+        note_olderThan: "Los mensajes más nuevos siguen sin leer. En este modo, los canales con menciones siempre quedan sin leer.",
+        olderThan_off: "Todos los mensajes",
+        olderThan_hours: "{n} h",
+        set_keepMentions: "Dejar sin leer los canales con menciones",
+        channels_excluded: "Canales excluidos (clic derecho en un canal para añadirlo)",
+        channels_none: "Ninguno",
+        button_clear: "Quitar todos",
+        tooltip_more: "+{n} más",
     },
     fi: {
         context_unreadguilds: "Lukemattomat palvelimet",
@@ -1225,6 +1408,15 @@ const labels = {
         interval_minutes: "{n} minuutti",
         context_blacklist: "Jätä pois read all -toiminnosta",
         tooltip_middle: "Keskinapsautus merkitsee vain nykyisen palvelimen luetuksi",
+        set_olderThan: "Merkitse luetuiksi vain viestit, jotka ovat vanhempia kuin",
+        note_olderThan: "Uudemmat viestit jäävät lukemattomiksi. Kanavat, joissa on mainintoja, jäävät tässä tilassa aina lukemattomiksi.",
+        olderThan_off: "Kaikki viestit",
+        olderThan_hours: "{n} t",
+        set_keepMentions: "Jätä kanavat, joissa on mainintoja, lukemattomiksi",
+        channels_excluded: "Pois jätetyt kanavat (lisää napsauttamalla kanavaa hiiren oikealla)",
+        channels_none: "Ei yhtään",
+        button_clear: "Poista kaikki",
+        tooltip_more: "+{n} muuta",
     },
     fr: {
         context_unreadguilds: "Serveurs non lus",
@@ -1280,6 +1472,15 @@ const labels = {
         interval_minutes: "{n} minutes",
         context_blacklist: "Exclure de read all",
         tooltip_middle: "Le clic du milieu marque uniquement le serveur actuel comme lu",
+        set_olderThan: "Marquer comme lus uniquement les messages plus anciens que",
+        note_olderThan: "Les messages plus récents restent non lus. Dans ce mode, les salons avec mentions restent toujours non lus.",
+        olderThan_off: "Tous les messages",
+        olderThan_hours: "{n} h",
+        set_keepMentions: "Laisser non lus les salons avec mentions",
+        channels_excluded: "Salons exclus (clic droit sur un salon pour l'ajouter)",
+        channels_none: "Aucun",
+        button_clear: "Tout retirer",
+        tooltip_more: "+{n} autres",
     },
     hi: {
         context_unreadguilds: "अपठित सर्वर",
@@ -1335,6 +1536,15 @@ const labels = {
         interval_minutes: "{n} मिनट",
         context_blacklist: "read all से बाहर रखें",
         tooltip_middle: "मिडल क्लिक केवल मौजूदा सर्वर को पढ़ा हुआ चिह्नित करता है",
+        set_olderThan: "केवल इससे पुराने मैसेज को पढ़ा हुआ चिह्नित करें",
+        note_olderThan: "नए मैसेज अपठित रहते हैं। इस मोड में उल्लेख वाले चैनल हमेशा अपठित रहते हैं।",
+        olderThan_off: "सभी मैसेज",
+        olderThan_hours: "{n} घंटे",
+        set_keepMentions: "उल्लेख वाले चैनल अपठित रहने दें",
+        channels_excluded: "बाहर रखे गए चैनल (जोड़ने के लिए चैनल पर राइट क्लिक करें)",
+        channels_none: "कोई नहीं",
+        button_clear: "सभी हटाएँ",
+        tooltip_more: "+{n} और",
     },
     hr: {
         context_unreadguilds: "Nepročitani poslužitelji",
@@ -1390,6 +1600,15 @@ const labels = {
         interval_minutes: "{n} minuta",
         context_blacklist: "Izuzmi iz read all",
         tooltip_middle: "Srednji klik označava samo trenutačni poslužitelj kao pročitan",
+        set_olderThan: "Označi kao pročitane samo poruke starije od",
+        note_olderThan: "Novije poruke ostaju nepročitane. Kanali sa spominjanjima u ovom načinu uvijek ostaju nepročitani.",
+        olderThan_off: "Sve poruke",
+        olderThan_hours: "{n} h",
+        set_keepMentions: "Kanale sa spominjanjima ostavi nepročitanima",
+        channels_excluded: "Izuzeti kanali (desni klik na kanal za dodavanje)",
+        channels_none: "Nema",
+        button_clear: "Ukloni sve",
+        tooltip_more: "+{n} više",
     },
     hu: {
         context_unreadguilds: "Olvasatlan szerverek",
@@ -1445,6 +1664,15 @@ const labels = {
         interval_minutes: "{n} perc",
         context_blacklist: "Kizárás a read all alól",
         tooltip_middle: "A középső kattintás csak a jelenlegi szervert jelöli olvasottnak",
+        set_olderThan: "Csak az ennél régebbi üzenetek olvasottnak jelölése:",
+        note_olderThan: "Az újabb üzenetek olvasatlanok maradnak. Ebben a módban az említéses csatornák mindig olvasatlanok maradnak.",
+        olderThan_off: "Minden üzenet",
+        olderThan_hours: "{n} óra",
+        set_keepMentions: "Az említéses csatornák maradjanak olvasatlanok",
+        channels_excluded: "Kizárt csatornák (jobb kattintás egy csatornára a hozzáadáshoz)",
+        channels_none: "Nincs",
+        button_clear: "Összes eltávolítása",
+        tooltip_more: "+{n} további",
     },
     id: {
         context_unreadguilds: "Server belum dibaca",
@@ -1500,6 +1728,15 @@ const labels = {
         interval_minutes: "{n} menit",
         context_blacklist: "Kecualikan dari read all",
         tooltip_middle: "Klik tengah hanya menandai server saat ini sebagai sudah dibaca",
+        set_olderThan: "Hanya tandai sudah dibaca pesan yang lebih lama dari",
+        note_olderThan: "Pesan yang lebih baru tetap belum dibaca. Dalam mode ini, saluran dengan sebutan selalu tetap belum dibaca.",
+        olderThan_off: "Semua pesan",
+        olderThan_hours: "{n} jam",
+        set_keepMentions: "Biarkan saluran dengan sebutan belum dibaca",
+        channels_excluded: "Saluran yang dikecualikan (klik kanan saluran untuk menambahkan)",
+        channels_none: "Tidak ada",
+        button_clear: "Hapus semua",
+        tooltip_more: "+{n} lainnya",
     },
     it: {
         context_unreadguilds: "Server non letti",
@@ -1555,6 +1792,15 @@ const labels = {
         interval_minutes: "{n} minuti",
         context_blacklist: "Escludi da read all",
         tooltip_middle: "Il clic centrale segna come letto solo il server attuale",
+        set_olderThan: "Segna come letti solo i messaggi più vecchi di",
+        note_olderThan: "I messaggi più recenti restano non letti. In questa modalità i canali con menzioni restano sempre non letti.",
+        olderThan_off: "Tutti i messaggi",
+        olderThan_hours: "{n} h",
+        set_keepMentions: "Lascia non letti i canali con menzioni",
+        channels_excluded: "Canali esclusi (clic destro su un canale per aggiungerlo)",
+        channels_none: "Nessuno",
+        button_clear: "Rimuovi tutti",
+        tooltip_more: "+{n} altri",
     },
     ja: {
         context_unreadguilds: "未読のサーバー",
@@ -1610,6 +1856,15 @@ const labels = {
         interval_minutes: "{n} 分",
         context_blacklist: "read all の対象外にする",
         tooltip_middle: "中クリックで現在のサーバーだけを既読にします",
+        set_olderThan: "既読にするのはこれより古いメッセージだけ",
+        note_olderThan: "新しいメッセージは未読のままです。このモードではメンションのあるチャンネルは常に未読のままです。",
+        olderThan_off: "すべてのメッセージ",
+        olderThan_hours: "{n} 時間",
+        set_keepMentions: "メンションのあるチャンネルは未読のままにする",
+        channels_excluded: "対象外のチャンネル（チャンネルを右クリックして追加）",
+        channels_none: "なし",
+        button_clear: "すべて解除",
+        tooltip_more: "ほか {n} 件",
     },
     ko: {
         context_unreadguilds: "읽지 않은 서버",
@@ -1665,6 +1920,15 @@ const labels = {
         interval_minutes: "{n}분",
         context_blacklist: "read all에서 제외",
         tooltip_middle: "가운데 클릭은 현재 서버만 읽음 처리합니다",
+        set_olderThan: "다음보다 오래된 메시지만 읽음 처리",
+        note_olderThan: "더 최근 메시지는 읽지 않음으로 남습니다. 이 모드에서는 멘션이 있는 채널이 항상 읽지 않음으로 남습니다.",
+        olderThan_off: "모든 메시지",
+        olderThan_hours: "{n}시간",
+        set_keepMentions: "멘션이 있는 채널은 읽지 않음으로 두기",
+        channels_excluded: "제외한 채널 (채널을 우클릭해 추가)",
+        channels_none: "없음",
+        button_clear: "모두 해제",
+        tooltip_more: "외 {n}개",
     },
     lt: {
         context_unreadguilds: "Neperskaityti serveriai",
@@ -1720,6 +1984,15 @@ const labels = {
         interval_minutes: "{n} min.",
         context_blacklist: "Neįtraukti į read all",
         tooltip_middle: "Vidurinis spustelėjimas pažymi kaip perskaitytą tik dabartinį serverį",
+        set_olderThan: "Pažymėti kaip perskaitytas tik žinutes, senesnes nei",
+        note_olderThan: "Naujesnės žinutės lieka neperskaitytos. Šiuo režimu kanalai su paminėjimais visada lieka neperskaityti.",
+        olderThan_off: "Visos žinutės",
+        olderThan_hours: "{n} val.",
+        set_keepMentions: "Kanalus su paminėjimais palikti neperskaitytus",
+        channels_excluded: "Neįtraukti kanalai (dešiniuoju spustelėk kanalą, kad pridėtum)",
+        channels_none: "Nėra",
+        button_clear: "Pašalinti visus",
+        tooltip_more: "+{n} daugiau",
     },
     nl: {
         context_unreadguilds: "Ongelezen servers",
@@ -1775,6 +2048,15 @@ const labels = {
         interval_minutes: "{n} minuten",
         context_blacklist: "Uitsluiten van read all",
         tooltip_middle: "Middelklik markeert alleen de huidige server als gelezen",
+        set_olderThan: "Alleen berichten als gelezen markeren die ouder zijn dan",
+        note_olderThan: "Nieuwere berichten blijven ongelezen. Kanalen met vermeldingen blijven in deze modus altijd ongelezen.",
+        olderThan_off: "Alle berichten",
+        olderThan_hours: "{n} u",
+        set_keepMentions: "Kanalen met vermeldingen ongelezen laten",
+        channels_excluded: "Uitgesloten kanalen (rechtsklik op een kanaal om toe te voegen)",
+        channels_none: "Geen",
+        button_clear: "Alles verwijderen",
+        tooltip_more: "+{n} meer",
     },
     no: {
         context_unreadguilds: "Uleste servere",
@@ -1830,6 +2112,15 @@ const labels = {
         interval_minutes: "{n} minutter",
         context_blacklist: "Utelat fra read all",
         tooltip_middle: "Midtklikk merker bare den nåværende serveren som lest",
+        set_olderThan: "Merk bare meldinger som lest som er eldre enn",
+        note_olderThan: "Nyere meldinger forblir uleste. Kanaler med omtaler forblir alltid uleste i denne modusen.",
+        olderThan_off: "Alle meldinger",
+        olderThan_hours: "{n} t",
+        set_keepMentions: "La kanaler med omtaler forbli uleste",
+        channels_excluded: "Utelatte kanaler (høyreklikk på en kanal for å legge til)",
+        channels_none: "Ingen",
+        button_clear: "Fjern alle",
+        tooltip_more: "+{n} til",
     },
     pl: {
         context_unreadguilds: "Nieprzeczytane serwery",
@@ -1885,6 +2176,15 @@ const labels = {
         interval_minutes: "{n} min",
         context_blacklist: "Wyklucz z read all",
         tooltip_middle: "Środkowy klik oznacza jako przeczytany tylko bieżący serwer",
+        set_olderThan: "Oznaczaj jako przeczytane tylko wiadomości starsze niż",
+        note_olderThan: "Nowsze wiadomości pozostają nieprzeczytane. W tym trybie kanały ze wzmiankami zawsze pozostają nieprzeczytane.",
+        olderThan_off: "Wszystkie wiadomości",
+        olderThan_hours: "{n} godz.",
+        set_keepMentions: "Zostaw kanały ze wzmiankami nieprzeczytane",
+        channels_excluded: "Wykluczone kanały (kliknij kanał prawym przyciskiem, aby dodać)",
+        channels_none: "Brak",
+        button_clear: "Usuń wszystkie",
+        tooltip_more: "+{n} więcej",
     },
     "pt-BR": {
         context_unreadguilds: "Servidores não lidos",
@@ -1940,6 +2240,15 @@ const labels = {
         interval_minutes: "{n} minutos",
         context_blacklist: "Excluir do read all",
         tooltip_middle: "O clique do meio marca como lido apenas o servidor atual",
+        set_olderThan: "Marcar como lidas só as mensagens mais antigas que",
+        note_olderThan: "Mensagens mais novas continuam não lidas. Neste modo, canais com menções sempre continuam não lidos.",
+        olderThan_off: "Todas as mensagens",
+        olderThan_hours: "{n} h",
+        set_keepMentions: "Deixar canais com menções não lidos",
+        channels_excluded: "Canais excluídos (clique com o botão direito em um canal para adicionar)",
+        channels_none: "Nenhum",
+        button_clear: "Remover todos",
+        tooltip_more: "+{n} outros",
     },
     ro: {
         context_unreadguilds: "Servere necitite",
@@ -1995,6 +2304,15 @@ const labels = {
         interval_minutes: "{n} minute",
         context_blacklist: "Exclude din read all",
         tooltip_middle: "Clicul din mijloc marchează ca citit doar serverul curent",
+        set_olderThan: "Marchează ca citite doar mesajele mai vechi de",
+        note_olderThan: "Mesajele mai noi rămân necitite. În acest mod, canalele cu mențiuni rămân mereu necitite.",
+        olderThan_off: "Toate mesajele",
+        olderThan_hours: "{n} h",
+        set_keepMentions: "Lasă necitite canalele cu mențiuni",
+        channels_excluded: "Canale excluse (clic dreapta pe un canal pentru a-l adăuga)",
+        channels_none: "Niciunul",
+        button_clear: "Elimină toate",
+        tooltip_more: "+{n} în plus",
     },
     ru: {
         context_unreadguilds: "Непрочитанные серверы",
@@ -2050,6 +2368,15 @@ const labels = {
         interval_minutes: "{n} мин",
         context_blacklist: "Исключить из read all",
         tooltip_middle: "Средний клик отмечает как прочитанный только текущий сервер",
+        set_olderThan: "Отмечать прочитанными только сообщения старше",
+        note_olderThan: "Более новые сообщения остаются непрочитанными. В этом режиме каналы с упоминаниями всегда остаются непрочитанными.",
+        olderThan_off: "Все сообщения",
+        olderThan_hours: "{n} ч",
+        set_keepMentions: "Оставлять каналы с упоминаниями непрочитанными",
+        channels_excluded: "Исключённые каналы (правый клик по каналу, чтобы добавить)",
+        channels_none: "Нет",
+        button_clear: "Удалить все",
+        tooltip_more: "+{n} ещё",
     },
     "sv-SE": {
         context_unreadguilds: "Olästa servrar",
@@ -2105,6 +2432,15 @@ const labels = {
         interval_minutes: "{n} minut",
         context_blacklist: "Undanta från read all",
         tooltip_middle: "Mittenklick markerar bara den nuvarande servern som läst",
+        set_olderThan: "Markera bara meddelanden som lästa som är äldre än",
+        note_olderThan: "Nyare meddelanden förblir olästa. Kanaler med omnämnanden förblir alltid olästa i det här läget.",
+        olderThan_off: "Alla meddelanden",
+        olderThan_hours: "{n} tim",
+        set_keepMentions: "Låt kanaler med omnämnanden förbli olästa",
+        channels_excluded: "Undantagna kanaler (högerklicka på en kanal för att lägga till)",
+        channels_none: "Inga",
+        button_clear: "Ta bort alla",
+        tooltip_more: "+{n} till",
     },
     th: {
         context_unreadguilds: "เซิร์ฟเวอร์ที่ยังไม่ได้อ่าน",
@@ -2160,6 +2496,15 @@ const labels = {
         interval_minutes: "{n} นาที",
         context_blacklist: "ไม่รวมใน read all",
         tooltip_middle: "คลิกกลางจะทำเครื่องหมายว่าอ่านแล้วเฉพาะเซิร์ฟเวอร์ปัจจุบัน",
+        set_olderThan: "ทำเครื่องหมายว่าอ่านแล้วเฉพาะข้อความที่เก่ากว่า",
+        note_olderThan: "ข้อความที่ใหม่กว่าจะยังไม่ได้อ่าน ในโหมดนี้ช่องที่มีการกล่าวถึงจะยังไม่ได้อ่านเสมอ",
+        olderThan_off: "ข้อความทั้งหมด",
+        olderThan_hours: "{n} ชม.",
+        set_keepMentions: "ให้ช่องที่มีการกล่าวถึงยังไม่ได้อ่าน",
+        channels_excluded: "ช่องที่ไม่รวม (คลิกขวาที่ช่องเพื่อเพิ่ม)",
+        channels_none: "ไม่มี",
+        button_clear: "ลบทั้งหมด",
+        tooltip_more: "+อีก {n}",
     },
     tr: {
         context_unreadguilds: "Okunmamış Sunucular",
@@ -2215,6 +2560,15 @@ const labels = {
         interval_minutes: "{n} dakika",
         context_blacklist: "read all dışında tut",
         tooltip_middle: "Orta tık yalnızca geçerli sunucuyu okundu işaretler",
+        set_olderThan: "Yalnızca şundan eski mesajları okundu işaretle",
+        note_olderThan: "Daha yeni mesajlar okunmamış kalır. Bu modda bahsetme içeren kanallar her zaman okunmamış kalır.",
+        olderThan_off: "Tüm mesajlar",
+        olderThan_hours: "{n} sa",
+        set_keepMentions: "Bahsetme içeren kanalları okunmamış bırak",
+        channels_excluded: "Hariç tutulan kanallar (eklemek için bir kanala sağ tıkla)",
+        channels_none: "Yok",
+        button_clear: "Tümünü kaldır",
+        tooltip_more: "+{n} daha",
     },
     uk: {
         context_unreadguilds: "Непрочитані сервери",
@@ -2270,6 +2624,15 @@ const labels = {
         interval_minutes: "{n} хв",
         context_blacklist: "Виключити з read all",
         tooltip_middle: "Середній клік позначає як прочитаний лише поточний сервер",
+        set_olderThan: "Позначати прочитаними лише повідомлення, старші за",
+        note_olderThan: "Новіші повідомлення залишаються непрочитаними. У цьому режимі канали зі згадками завжди залишаються непрочитаними.",
+        olderThan_off: "Усі повідомлення",
+        olderThan_hours: "{n} год",
+        set_keepMentions: "Залишати канали зі згадками непрочитаними",
+        channels_excluded: "Виключені канали (правий клік по каналу, щоб додати)",
+        channels_none: "Немає",
+        button_clear: "Видалити всі",
+        tooltip_more: "+{n} ще",
     },
     vi: {
         context_unreadguilds: "Máy chủ chưa đọc",
@@ -2325,6 +2688,15 @@ const labels = {
         interval_minutes: "{n} phút",
         context_blacklist: "Loại khỏi read all",
         tooltip_middle: "Nhấp chuột giữa chỉ đánh dấu máy chủ hiện tại là đã đọc",
+        set_olderThan: "Chỉ đánh dấu đã đọc các tin nhắn cũ hơn",
+        note_olderThan: "Tin nhắn mới hơn vẫn chưa đọc. Ở chế độ này, kênh có lượt nhắc luôn giữ trạng thái chưa đọc.",
+        olderThan_off: "Tất cả tin nhắn",
+        olderThan_hours: "{n} giờ",
+        set_keepMentions: "Giữ kênh có lượt nhắc ở trạng thái chưa đọc",
+        channels_excluded: "Kênh đã loại trừ (nhấp chuột phải vào kênh để thêm)",
+        channels_none: "Không có",
+        button_clear: "Xóa tất cả",
+        tooltip_more: "+{n} khác",
     },
     "zh-CN": {
         context_unreadguilds: "未读服务器",
@@ -2380,6 +2752,15 @@ const labels = {
         interval_minutes: "{n} 分钟",
         context_blacklist: "不参与 read all",
         tooltip_middle: "中键点击只将当前服务器标记为已读",
+        set_olderThan: "只将早于以下时间的消息标记为已读",
+        note_olderThan: "较新的消息保持未读。在此模式下，有提及的频道始终保持未读。",
+        olderThan_off: "所有消息",
+        olderThan_hours: "{n} 小时",
+        set_keepMentions: "有提及的频道保持未读",
+        channels_excluded: "已排除的频道（右键点击频道即可添加）",
+        channels_none: "无",
+        button_clear: "全部移除",
+        tooltip_more: "另有 {n} 个",
     },
     "zh-TW": {
         context_unreadguilds: "未讀伺服器",
@@ -2435,5 +2816,14 @@ const labels = {
         interval_minutes: "{n} 分鐘",
         context_blacklist: "不參與 read all",
         tooltip_middle: "中鍵點擊只將目前的伺服器標示為已讀",
+        set_olderThan: "只將早於以下時間的訊息標示為已讀",
+        note_olderThan: "較新的訊息保持未讀。在此模式下，有提及的頻道一律保持未讀。",
+        olderThan_off: "所有訊息",
+        olderThan_hours: "{n} 小時",
+        set_keepMentions: "有提及的頻道保持未讀",
+        channels_excluded: "已排除的頻道（右鍵點擊頻道即可加入）",
+        channels_none: "無",
+        button_clear: "全部移除",
+        tooltip_more: "另有 {n} 個",
     },
 };
