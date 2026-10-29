@@ -1,8 +1,8 @@
 /**
  * @name ReadAllNotificationsButtonv2
  * @author uwemanfred64-png
- * @description Adds a "read all" button to the server list that marks every notification as read at once, and a button to the mentions popout that clears all mentions. Includes a counter, Shift+click to read everything, middle click for the current server, a keybind, folders in the context menu, a server black list, timed and automatic reading, reading only older messages, keeping channels with mentions unread, excluded channels and 30 selectable languages. No library needed.
- * @version 2.1.1
+ * @description Adds a "read all" button to the server list that marks every notification as read at once, and a button to the mentions popout that clears all mentions. Includes a counter, Shift+click to read everything, middle click for the current server, a keybind, folders in the context menu, a server black list, timed and automatic reading, reading only older messages, keeping channels with mentions unread, excluded channels, active hours, statistics, one-click updates and 30 selectable languages. No library needed.
+ * @version 3.0.0
  * @invite bQeNQPHVcR
  * @source https://github.com/uwemanfred64-png/ReadAllNotificationsButtonv2
  * @website https://github.com/uwemanfred64-png/ReadAllNotificationsButtonv2
@@ -25,11 +25,17 @@ const TOOLTIP_NAMES = 5;
 const PARENT_DEPTH = 3;
 const INTERVALS = [0, 5, 15, 30, 60];
 const MIDDLE_BUTTON = 1;
+const DAY = 24 * HOUR;
+const CONFIRM_MODES = ["never", "always", "5", "10", "25"];
+const UPDATE_URL = "https://raw.githubusercontent.com/uwemanfred64-png/ReadAllNotificationsButtonv2/main/ReadAllNotificationsButtonv2.plugin.js";
+const UPDATE_DELAY = 10000;
+const UPDATE_INTERVAL = 6 * HOUR;
+const FILE_NAME = "ReadAllNotificationsButtonv2.plugin.js";
 
 const defaults = {
-    general: { language: "auto", addClearButton: true, confirmClear: false },
+    general: { language: "auto", addClearButton: true, confirm: "never", checkUpdates: true, clearMarksRead: false },
     batch: { guilds: true, muted: false, dms: false },
-    extras: { label: "read all", badgeMode: "mentions", olderThan: 0, keepMentions: false, hideWhenEmpty: false, toast: true, autoMuted: false, readOnStart: false, interval: 0, hotkey: [] },
+    extras: { label: "read all", buttonStyle: "text", badgeMode: "mentions", olderThan: 0, keepMentions: false, hideWhenEmpty: false, toast: true, autoMuted: false, readOnStart: false, readOnLeave: false, interval: 0, activeFrom: -1, activeTo: -1, hotkey: [], clearHotkey: [] },
 };
 
 const modifiers = { Control: "ctrlKey", Shift: "shiftKey", Alt: "altKey", Meta: "metaKey" };
@@ -84,6 +90,27 @@ function matchesHotkey(event, combo) {
     return (event.key ?? "").toLowerCase() === key || code === `key${key}` || code === `digit${key}`;
 }
 
+function isNewer(remote, local) {
+    const a = String(remote).split(".").map(Number);
+    const b = String(local).split(".").map(Number);
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+        if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0);
+    }
+    return false;
+}
+
+function checkIcon(size) {
+    const ns = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(ns, "svg");
+    for (const [key, value] of Object.entries({ width: size, height: size, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "2.5", "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true" })) svg.setAttribute(key, value);
+    for (const d of ["M18 6 7 17l-5-5", "m22 10-7.5 7.5L13 16"]) {
+        const path = document.createElementNS(ns, "path");
+        path.setAttribute("d", d);
+        svg.append(path);
+    }
+    return svg;
+}
+
 function closeIcon(size) {
     const ns = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(ns, "svg");
@@ -101,11 +128,14 @@ function closeIcon(size) {
 module.exports = class ReadAllNotificationsButtonv2 {
     constructor(meta) {
         this.api = new BdApi(meta.name);
+        this.version = meta.version;
+        this.fileName = meta.filename ?? FILE_NAME;
         this.timers = new Set();
         this.autoQueue = new Set();
         this.refresh = this.refresh.bind(this);
         this.onKeyDown = this.onKeyDown.bind(this);
         this.onMessage = this.onMessage.bind(this);
+        this.onGuildChange = this.onGuildChange.bind(this);
     }
 
     get t() {
@@ -162,6 +192,7 @@ module.exports = class ReadAllNotificationsButtonv2 {
 
         const saved = Data.load("settings") ?? {};
         if (saved.extras?.badge === false && !saved.extras.badgeMode) saved.extras.badgeMode = "off";
+        if (saved.general && typeof saved.general.confirmClear === "boolean" && !saved.general.confirm) saved.general.confirm = saved.general.confirmClear ? "always" : "never";
         this.settings = Object.fromEntries(Object.entries(defaults).map(([group, values]) => [
             group,
             Object.fromEntries(Object.entries(values).map(([key, value]) => [key, saved[group]?.[key] ?? value])),
@@ -170,10 +201,13 @@ module.exports = class ReadAllNotificationsButtonv2 {
         this.channelBlacklist = Array.isArray(channelBlacklist) ? channelBlacklist : [];
         const blacklist = Data.load("blacklist");
         this.blacklist = Array.isArray(blacklist) ? blacklist : [];
+        this.stats = { servers: 0, dms: 0, mentions: 0, ...Data.load("stats") };
 
         DOM.addStyle("main", this.css());
 
         for (const s of [GuildReadState, ReadState, this.stores.RecentMentions]) s?.addChangeListener(this.refresh);
+        this.lastGuild = this.stores.SelectedGuild?.getGuildId() ?? null;
+        this.stores.SelectedGuild?.addChangeListener(this.onGuildChange);
         window.addEventListener("keydown", this.onKeyDown, true);
         this.dispatcher?.subscribe("MESSAGE_CREATE", this.onMessage);
         this.unpatchMenus = [
@@ -185,11 +219,18 @@ module.exports = class ReadAllNotificationsButtonv2 {
         this.sync();
         this.setupInterval();
         if (this.settings.extras.autoMuted) this.readGuilds(this.mutedGuilds());
-        if (this.settings.extras.readOnStart) this.later(() => this.readBatch(), START_DELAY);
+        if (this.settings.extras.readOnStart) this.later(() => this.inActiveHours() && this.readBatch(), START_DELAY);
+        this.later(() => this.checkForUpdate(), UPDATE_DELAY);
+        this.updateTimer = setInterval(() => this.checkForUpdate(), UPDATE_INTERVAL);
     }
 
     stop() {
         for (const s of [this.stores?.GuildReadState, this.stores?.ReadState, this.stores?.RecentMentions]) s?.removeChangeListener(this.refresh);
+        this.stores?.SelectedGuild?.removeChangeListener(this.onGuildChange);
+        clearInterval(this.updateTimer);
+        this.updateTimer = null;
+        this.closeNotice?.();
+        this.closeNotice = null;
         window.removeEventListener("keydown", this.onKeyDown, true);
         this.dispatcher?.unsubscribe("MESSAGE_CREATE", this.onMessage);
         for (const unpatch of this.unpatchMenus ?? []) unpatch();
@@ -305,8 +346,17 @@ module.exports = class ReadAllNotificationsButtonv2 {
         const { extras } = this.settings;
         const mentions = this.mentionCount();
         const count = extras.badgeMode === "unread" ? this.unreadGuilds().length + this.unreadDMs().length : mentions;
+        const text = extras.label || defaults.extras.label;
 
-        this.label.textContent = extras.label || defaults.extras.label;
+        if (this.renderedLabel !== `${extras.buttonStyle}|${text}`) {
+            this.renderedLabel = `${extras.buttonStyle}|${text}`;
+            const parts = [];
+            if (extras.buttonStyle !== "text") parts.push(checkIcon(14));
+            if (extras.buttonStyle !== "icon") parts.push(el("span", { textContent: text }));
+            this.label.replaceChildren(...parts);
+            this.label.classList.toggle("ranb-with-icon", extras.buttonStyle !== "text");
+            this.label.setAttribute("aria-label", text);
+        }
         this.badge.textContent = count > 99 ? "99+" : String(count);
         this.badge.hidden = extras.badgeMode === "off" || count === 0;
         this.badge.classList.toggle("ranb-badge-unread", extras.badgeMode === "unread");
@@ -315,17 +365,91 @@ module.exports = class ReadAllNotificationsButtonv2 {
 
     onButtonClick(everything) {
         const run = () => (everything ? this.readEverything() : this.readBatch());
-        if (this.settings.general.confirmClear) this.confirm(this.t.modal_confirmnotifications, run);
+        const count = everything
+            ? this.allGuilds().filter(id => this.guildHasUnread(id)).length + this.unreadDMs().length
+            : this.selectedGuilds().filter(id => this.guildHasUnread(id)).length + (this.settings.batch.dms ? this.pingedDMs().length : 0);
+        if (this.needsConfirm(count)) this.confirm(this.t.modal_confirmnotifications, run);
         else run();
     }
 
-    readBatch(quiet = false) {
-        if (!this.settings) return;
+    needsConfirm(count) {
+        const mode = this.settings.general.confirm;
+        if (mode === "always") return true;
+        if (mode === "never" || !Number(mode)) return false;
+        return count >= Number(mode);
+    }
+
+    inActiveHours() {
+        const from = Number(this.settings?.extras.activeFrom);
+        const to = Number(this.settings?.extras.activeTo);
+        if (!(from >= 0) || !(to >= 0) || from === to) return true;
+        const hour = new Date().getHours();
+        return from < to ? hour >= from && hour < to : hour >= from || hour < to;
+    }
+
+    selectedGuilds() {
         const { batch } = this.settings;
         const guilds = [];
         if (batch.guilds) guilds.push(...this.unreadGuilds());
         if (batch.muted) guilds.push(...this.mutedGuilds());
-        this.report(this.readGuilds(guilds), batch.dms ? this.readDMs(this.pingedDMs()) : 0, quiet);
+        return guilds;
+    }
+
+    onGuildChange() {
+        const current = this.stores.SelectedGuild?.getGuildId() ?? null;
+        const previous = this.lastGuild;
+        this.lastGuild = current;
+        if (this.settings?.extras.readOnLeave && previous && previous !== current) this.readGuilds([previous]);
+    }
+
+    countStat(key, n) {
+        if (!n || !this.stats) return;
+        this.stats[key] = (this.stats[key] || 0) + n;
+        this.api.Data.save("stats", this.stats);
+    }
+
+    resetStats() {
+        this.stats = { servers: 0, dms: 0, mentions: 0 };
+        this.api.Data.save("stats", this.stats);
+    }
+
+    async checkForUpdate() {
+        if (!this.settings?.general.checkUpdates || this.closeNotice || !this.api.Net?.fetch) return;
+        try {
+            const response = await this.api.Net.fetch(UPDATE_URL);
+            if (!response.ok) return;
+            const code = await response.text();
+            const remote = /@version\s+([\d.]+)/.exec(code)?.[1];
+            if (!this.settings || !remote || !isNewer(remote, this.version) || !code.includes("@name ReadAllNotificationsButtonv2")) return;
+            const t = this.t;
+            this.closeNotice = this.api.UI.showNotice(format(t.notice_update, { version: remote }), {
+                type: "info",
+                buttons: [{ label: t.button_update, onClick: close => {
+                    close?.();
+                    this.closeNotice = null;
+                    this.installUpdate(code, remote);
+                } }],
+            });
+        } catch (err) {
+            console.error("[ReadAllNotificationsButtonv2]", err);
+        }
+    }
+
+    installUpdate(code, version) {
+        const t = this.t;
+        try {
+            const fs = require("fs");
+            const path = require("path");
+            fs.writeFileSync(path.join(this.api.Plugins.folder, this.fileName), code);
+            this.api.UI.showToast(format(t.toast_updated, { version }), { type: "success" });
+        } catch (err) {
+            this.api.UI.showToast(format(t.toast_updateFailed, { error: err?.message ?? String(err) }), { type: "error" });
+        }
+    }
+
+    readBatch(quiet = false) {
+        if (!this.settings) return;
+        this.report(this.readGuilds(this.selectedGuilds()), this.settings.batch.dms ? this.readDMs(this.pingedDMs()) : 0, quiet);
     }
 
     readCurrent() {
@@ -337,7 +461,7 @@ module.exports = class ReadAllNotificationsButtonv2 {
         clearInterval(this.intervalTimer);
         this.intervalTimer = null;
         const minutes = Number(this.settings?.extras.interval) || 0;
-        if (minutes > 0) this.intervalTimer = setInterval(() => this.readBatch(true), minutes * MINUTE);
+        if (minutes > 0) this.intervalTimer = setInterval(() => this.inActiveHours() && this.readBatch(true), minutes * MINUTE);
     }
 
     extendGuildMenu(tree, props) {
@@ -557,6 +681,7 @@ module.exports = class ReadAllNotificationsButtonv2 {
         if (whole.length) {
             try {
                 this.markGuildsRead(whole);
+                this.countStat("servers", whole.length);
             } catch (err) {
                 console.error("[ReadAllNotificationsButtonv2]", err);
                 precise.push(...whole);
@@ -564,7 +689,7 @@ module.exports = class ReadAllNotificationsButtonv2 {
             }
         }
 
-        let touched = whole.length;
+        let touched = 0;
         const acks = [];
         for (const id of precise) {
             const guildAcks = this.channelAcks(id);
@@ -572,7 +697,8 @@ module.exports = class ReadAllNotificationsButtonv2 {
             acks.push(...guildAcks);
         }
         for (let i = 0; i < acks.length; i += ACK_CHUNK) this.bulkAck?.(acks.slice(i, i + ACK_CHUNK));
-        return touched;
+        this.countStat("servers", touched);
+        return touched + whole.length;
     }
 
     readDMs(channelIds) {
@@ -584,6 +710,7 @@ module.exports = class ReadAllNotificationsButtonv2 {
             const messageId = cutoff && last && BigInt(last) > BigInt(cutoff) ? cutoff : undefined;
             this.ack(id, undefined, false, false, messageId);
         }, i * DM_DELAY));
+        this.countStat("dms", unread.length);
         return unread.length;
     }
 
@@ -600,13 +727,17 @@ module.exports = class ReadAllNotificationsButtonv2 {
     }
 
     onKeyDown(event) {
-        if (!this.settings || !matchesHotkey(event, this.settings.extras.hotkey)) return;
+        if (!this.settings) return;
+        const read = matchesHotkey(event, this.settings.extras.hotkey);
+        const clear = !read && matchesHotkey(event, this.settings.extras.clearHotkey);
+        if (!read && !clear) return;
         if (document.querySelector(".bd-keybind-wrap.recording")) return;
         const typing = event.target?.closest?.('input, textarea, [contenteditable="true"]');
         if (typing && !event.ctrlKey && !event.altKey && !event.metaKey) return;
         event.preventDefault();
         event.stopPropagation();
-        this.onButtonClick(false);
+        if (read) this.onButtonClick(false);
+        else if (this.mentionActions) this.onClearMentionsClick("all");
     }
 
     onMessage({ message, guildId, optimistic }) {
@@ -620,7 +751,7 @@ module.exports = class ReadAllNotificationsButtonv2 {
             this.autoTimer = null;
             const ids = [...this.autoQueue];
             this.autoQueue.clear();
-            if (this.settings?.extras.autoMuted) this.readGuilds(ids.filter(g => this.stores.UserGuildSettings.isMuted(g)));
+            if (this.settings?.extras.autoMuted && this.inActiveHours()) this.readGuilds(ids.filter(g => this.stores.UserGuildSettings.isMuted(g)));
         }, AUTO_DELAY);
     }
 
@@ -665,34 +796,76 @@ module.exports = class ReadAllNotificationsButtonv2 {
         button.setAttribute("aria-label", this.t.tooltip_clear);
         button.addEventListener("click", e => {
             e.stopPropagation();
-            this.onClearMentionsClick();
+            this.onClearMentionsClick("all");
+        });
+        button.addEventListener("contextmenu", e => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.openClearMenu(e);
         });
         this.api.UI.createTooltip?.(button, this.t.tooltip_clear, { side: "top" });
         this.clearButton = button;
         return button;
     }
 
-    onClearMentionsClick() {
-        if (this.settings.general.confirmClear) this.confirm(this.t.modal_confirmmentions, () => this.clearMentions());
-        else this.clearMentions();
+    openClearMenu(event) {
+        const t = this.t;
+        const current = this.stores.SelectedGuild?.getGuildId();
+        const { ContextMenu } = this.api;
+        ContextMenu.open(event, ContextMenu.buildMenu([{
+            type: "group",
+            items: [
+                { id: "ranb-clear-all", label: t.context_clear_all, action: () => this.onClearMentionsClick("all") },
+                current && { id: "ranb-clear-server", label: t.context_clear_server, action: () => this.onClearMentionsClick("server") },
+                { id: "ranb-clear-old", label: t.context_clear_old, action: () => this.onClearMentionsClick("old") },
+            ].filter(Boolean),
+        }]));
     }
 
-    clearMentions() {
+    mentionsFor(scope) {
+        const current = this.stores.SelectedGuild?.getGuildId();
+        const oldest = snowflakeAt(Date.now() - DAY);
+        return (this.stores.RecentMentions?.getMentions?.() ?? []).filter(m => {
+            if (!m?.id) return false;
+            if (scope === "server") return (m.guild_id ?? this.stores.Channel.getChannel(m.channel_id)?.guild_id) === current;
+            if (scope === "old") return BigInt(m.id) < BigInt(oldest);
+            return true;
+        });
+    }
+
+    onClearMentionsClick(scope = "all") {
+        const count = this.mentionsFor(scope).length;
+        if (this.needsConfirm(count)) this.confirm(this.t.modal_confirmmentions, () => this.clearMentions(scope));
+        else this.clearMentions(scope);
+    }
+
+    clearMentions(scope = "all") {
         const t = this.t;
         if (this.clearing) return this.api.UI.showToast(t.toast_alreadyclearing, { type: "error" });
 
-        const ids = (this.stores.RecentMentions?.getMentions?.() ?? []).map(m => m?.id).filter(Boolean);
-        if (!ids.length) return;
+        const mentions = this.mentionsFor(scope);
+        if (!mentions.length) return this.api.UI.showToast(t.toast_noMentions, { type: "info" });
 
         this.clearing = true;
-        this.api.UI.showToast(format(t.toast_clearing, { n: ids.length }), { type: "info" });
-        ids.forEach((id, i) => this.later(() => {
-            Promise.resolve(this.mentionActions.deleteRecentMention(id)).catch(err => console.error("[ReadAllNotificationsButtonv2]", err));
-            if (i === ids.length - 1) {
+        this.api.UI.showToast(format(t.toast_clearing, { n: mentions.length }), { type: "info" });
+        mentions.forEach((mention, i) => this.later(() => {
+            Promise.resolve(this.mentionActions.deleteRecentMention(mention.id)).catch(err => console.error("[ReadAllNotificationsButtonv2]", err));
+            if (i === mentions.length - 1) {
                 this.clearing = false;
+                this.countStat("mentions", mentions.length);
+                if (this.settings?.general.clearMarksRead) this.readMentionChannels(mentions);
                 this.api.UI.showToast(t.toast_cleared, { type: "success" });
             }
         }, i * MENTION_DELAY));
+    }
+
+    readMentionChannels(mentions) {
+        const { ReadState } = this.stores;
+        const acks = [...new Set(mentions.map(m => m.channel_id).filter(Boolean))]
+            .filter(id => this.channelUnread(id) && !this.isExcludedChannel(id))
+            .map(id => ({ channelId: id, readStateType: this.readStateTypes.CHANNEL, messageId: ReadState.lastMessageId(id) }))
+            .filter(a => a.messageId);
+        for (let i = 0; i < acks.length; i += ACK_CHUNK) this.bulkAck?.(acks.slice(i, i + ACK_CHUNK));
     }
 
     saveBlacklist(list) {
@@ -722,11 +895,20 @@ module.exports = class ReadAllNotificationsButtonv2 {
                         options: [{ label: t.language_auto, value: "auto" }, ...Object.entries(languageNames).map(([value, label]) => ({ label, value }))],
                     },
                     toggle(general, "addClearButton"),
-                    toggle(general, "confirmClear"),
+                    toggle(general, "clearMarksRead"),
+                    {
+                        type: "dropdown",
+                        id: "confirm",
+                        name: t.set_confirm,
+                        value: general.confirm,
+                        options: CONFIRM_MODES.map(value => ({ label: Number(value) ? format(t.confirm_from, { n: value }) : t[`confirm_${value}`], value })),
+                    },
+                    toggle(general, "checkUpdates", t.note_checkUpdates),
                 ]),
                 category("batch", [toggle(batch, "guilds"), toggle(batch, "muted"), toggle(batch, "dms")]),
                 category("extras", [
                     { type: "text", id: "label", name: t.set_label, value: extras.label, placeholder: defaults.extras.label },
+                    { type: "dropdown", id: "buttonStyle", name: t.set_buttonStyle, value: extras.buttonStyle, options: ["text", "icon", "both"].map(value => ({ label: t[`style_${value}`], value })) },
                     { type: "dropdown", id: "badgeMode", name: t.set_badgeMode, value: extras.badgeMode, options: ["mentions", "unread", "off"].map(value => ({ label: t[`badge_${value}`], value })) },
                     {
                         type: "dropdown",
@@ -741,6 +923,7 @@ module.exports = class ReadAllNotificationsButtonv2 {
                     toggle(extras, "toast"),
                     toggle(extras, "autoMuted", t.note_autoMuted),
                     toggle(extras, "readOnStart"),
+                    toggle(extras, "readOnLeave"),
                     {
                         type: "dropdown",
                         id: "interval",
@@ -748,11 +931,17 @@ module.exports = class ReadAllNotificationsButtonv2 {
                         value: extras.interval,
                         options: INTERVALS.map(value => ({ label: value ? format(t.interval_minutes, { n: value }) : t.interval_off, value })),
                     },
+                    { type: "dropdown", id: "activeFrom", name: t.set_activeFrom, note: t.note_activeHours, value: extras.activeFrom, options: hourOptions(t) },
+                    { type: "dropdown", id: "activeTo", name: t.set_activeTo, value: extras.activeTo, options: hourOptions(t) },
                     { type: "keybind", id: "hotkey", name: t.set_hotkey, note: t.note_hotkey, value: extras.hotkey, clearable: true },
+                    { type: "keybind", id: "clearHotkey", name: t.set_clearHotkey, value: extras.clearHotkey, clearable: true },
                 ]),
                 category("blacklist", [
                     { type: "custom", id: "guilds", name: "", note: t.blacklist_note, inline: false, children: React.createElement(GuildList, { plugin: this }) },
                     { type: "custom", id: "channels", name: t.channels_excluded, inline: false, children: React.createElement(ChannelList, { plugin: this }) },
+                ], false),
+                category("stats", [
+                    { type: "custom", id: "stats", name: "", inline: false, children: React.createElement(StatsView, { plugin: this }) },
                 ], false),
             ],
             onChange: (group, id, value) => {
@@ -767,6 +956,7 @@ module.exports = class ReadAllNotificationsButtonv2 {
                 if (group === "general") this.syncInbox();
                 if (id === "interval") this.setupInterval();
                 if (id === "autoMuted" && value) this.readGuilds(this.mutedGuilds());
+                if (id === "checkUpdates" && value) this.checkForUpdate();
             },
         });
     }
@@ -783,6 +973,8 @@ ${controls ? `.${controls} { display: flex; align-items: center; gap: 8px; }` : 
 .ranb-frame.ranb-hidden { display: none; }
 #app-mount .ranb-frame, #app-mount .ranb-inner, #app-mount .ranb-button { height: 24px; }
 #app-mount .ranb-inner { width: auto; min-width: var(--guildbar-avatar-size); }
+.ranb-with-icon { display: flex; align-items: center; justify-content: center; gap: 4px; }
+.ranb-with-icon svg { flex-shrink: 0; }
 .ranb-button { box-sizing: border-box; padding: 0 4px; border-radius: 4px; font-size: 12px; line-height: 1.3; white-space: nowrap; cursor: pointer; }
 .ranb-plain { display: flex; justify-content: center; width: 100%; margin-bottom: 8px; }
 .ranb-plain .ranb-button { display: flex; align-items: center; justify-content: center; width: 100%; background: var(--background-base-low, #313338); color: var(--text-default, #dbdee1); }
@@ -802,6 +994,25 @@ ${controls ? `.${controls} { display: flex; align-items: center; gap: 8px; }` : 
 `;
     }
 };
+
+function hourOptions(t) {
+    return [{ label: t.hours_any, value: -1 }, ...Array.from({ length: 24 }, (_, h) => ({ label: `${String(h).padStart(2, "0")}:00`, value: h }))];
+}
+
+function StatsView({ plugin }) {
+    const { React, Components } = BdApi;
+    const [stats, setStats] = React.useState({ ...plugin.stats });
+    const t = plugin.t;
+    const reset = () => {
+        plugin.resetStats();
+        setStats({ ...plugin.stats });
+    };
+    const Button = Components?.Button;
+    return React.createElement("div", { className: "ranb-guild-action" },
+        React.createElement("span", null, format(t.stats_text, stats)),
+        Button ? React.createElement(Button, { color: Button.Colors?.PRIMARY, onClick: reset }, t.button_reset) : React.createElement("button", { onClick: reset }, t.button_reset)
+    );
+}
 
 function ChannelList({ plugin }) {
     const { React, Components } = BdApi;
@@ -932,7 +1143,6 @@ const labels = {
         settings_extras: "Extras",
         settings_blacklist: "Server Black List",
         set_addClearButton: "Adds a button to the mentions popout that clears all mentions",
-        set_confirmClear: "Asks for confirmation before marking or clearing",
         set_guilds: "Unread servers",
         set_muted: "Muted servers",
         set_dms: "Direct messages with mentions",
@@ -970,6 +1180,34 @@ const labels = {
         channels_none: "None",
         button_clear: "Remove all",
         tooltip_more: "+{n} more",
+        set_confirm: "Ask before marking or clearing",
+        confirm_never: "Never",
+        confirm_always: "Always",
+        confirm_from: "When {n} or more at once",
+        set_clearMarksRead: "Clearing mentions also marks their channels as read",
+        set_checkUpdates: "Check for updates",
+        note_checkUpdates: "Looks on GitHub for a new version and offers to install it with one click.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} is available.",
+        button_update: "Update",
+        toast_updated: "Updated to {version}",
+        toast_updateFailed: "Update failed: {error}",
+        set_buttonStyle: "Button style",
+        style_text: "Text",
+        style_icon: "Icon",
+        style_both: "Icon and text",
+        set_readOnLeave: "Mark a server as read when you switch to another one",
+        set_activeFrom: "Automatic reading from",
+        set_activeTo: "Automatic reading until",
+        note_activeHours: "Applies to the interval, muted servers and the start. The same hour or \"Any time\" means always.",
+        hours_any: "Any time",
+        set_clearHotkey: "Keybind for clearing mentions",
+        context_clear_all: "All mentions",
+        context_clear_server: "Mentions from this server",
+        context_clear_old: "Mentions older than one day",
+        settings_stats: "Statistics",
+        stats_text: "Marked as read: {servers} servers, {dms} DMs · Mentions cleared: {mentions}",
+        button_reset: "Reset",
+        toast_noMentions: "No matching mentions",
     },
     de: {
         context_unreadguilds: "Ungelesene Server",
@@ -996,7 +1234,6 @@ const labels = {
         settings_extras: "Zusatzfunktionen",
         settings_blacklist: "Server-Ausnahmen",
         set_addClearButton: "Button zum Entfernen aller Erwähnungen im Erwähnungen-Popout anzeigen",
-        set_confirmClear: "Vor dem Markieren und Entfernen nachfragen",
         set_guilds: "Ungelesene Server",
         set_muted: "Stummgeschaltete Server",
         set_dms: "Direktnachrichten mit Erwähnungen",
@@ -1034,6 +1271,34 @@ const labels = {
         channels_none: "Keine",
         button_clear: "Alle entfernen",
         tooltip_more: "+{n} weitere",
+        set_confirm: "Vor dem Markieren und Entfernen nachfragen",
+        confirm_never: "Nie",
+        confirm_always: "Immer",
+        confirm_from: "Ab {n} auf einmal",
+        set_clearMarksRead: "Beim Entfernen von Erwähnungen auch ihre Kanäle als gelesen markieren",
+        set_checkUpdates: "Nach Updates suchen",
+        note_checkUpdates: "Sucht auf GitHub nach einer neuen Version und bietet die Installation mit einem Klick an.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} ist verfügbar.",
+        button_update: "Aktualisieren",
+        toast_updated: "Auf {version} aktualisiert",
+        toast_updateFailed: "Update fehlgeschlagen: {error}",
+        set_buttonStyle: "Aussehen des Buttons",
+        style_text: "Text",
+        style_icon: "Symbol",
+        style_both: "Symbol und Text",
+        set_readOnLeave: "Server als gelesen markieren, wenn du zu einem anderen wechselst",
+        set_activeFrom: "Automatisch lesen ab",
+        set_activeTo: "Automatisch lesen bis",
+        note_activeHours: "Gilt für das Intervall, stummgeschaltete Server und den Start. Gleiche Uhrzeit oder „Jederzeit“ heißt immer.",
+        hours_any: "Jederzeit",
+        set_clearHotkey: "Tastenkürzel zum Entfernen der Erwähnungen",
+        context_clear_all: "Alle Erwähnungen",
+        context_clear_server: "Erwähnungen aus diesem Server",
+        context_clear_old: "Erwähnungen älter als ein Tag",
+        settings_stats: "Statistik",
+        stats_text: "Als gelesen markiert: {servers} Server, {dms} Direktnachrichten · Erwähnungen entfernt: {mentions}",
+        button_reset: "Zurücksetzen",
+        toast_noMentions: "Keine passenden Erwähnungen",
     },
     bg: {
         context_unreadguilds: "Непрочетени сървъри",
@@ -1060,7 +1325,6 @@ const labels = {
         settings_extras: "Допълнителни",
         settings_blacklist: "Черен списък със сървъри",
         set_addClearButton: "Добавя бутон в прозореца със споменавания, който ги премахва всички",
-        set_confirmClear: "Иска потвърждение преди отбелязване или премахване",
         set_guilds: "Непрочетени сървъри",
         set_muted: "Заглушени сървъри",
         set_dms: "Лични съобщения със споменавания",
@@ -1098,6 +1362,34 @@ const labels = {
         channels_none: "Няма",
         button_clear: "Премахни всички",
         tooltip_more: "+{n} още",
+        set_confirm: "Питане преди маркиране или изчистване",
+        confirm_never: "Никога",
+        confirm_always: "Винаги",
+        confirm_from: "От {n} наведнъж",
+        set_clearMarksRead: "Изчистването на споменавания отбелязва и техните канали като прочетени",
+        set_checkUpdates: "Проверка за актуализации",
+        note_checkUpdates: "Търси нова версия в GitHub и предлага инсталиране с едно щракване.",
+        notice_update: "Налична е ReadAllNotificationsButtonv2 {version}.",
+        button_update: "Актуализиране",
+        toast_updated: "Актуализирано до {version}",
+        toast_updateFailed: "Актуализацията не успя: {error}",
+        set_buttonStyle: "Стил на бутона",
+        style_text: "Текст",
+        style_icon: "Икона",
+        style_both: "Икона и текст",
+        set_readOnLeave: "Отбелязване на сървър като прочетен при преминаване към друг",
+        set_activeFrom: "Автоматично четене от",
+        set_activeTo: "Автоматично четене до",
+        note_activeHours: "Важи за интервала, заглушените сървъри и стартирането. Еднакъв час или „По всяко време“ означава винаги.",
+        hours_any: "По всяко време",
+        set_clearHotkey: "Клавишна комбинация за изчистване на споменавания",
+        context_clear_all: "Всички споменавания",
+        context_clear_server: "Споменавания от този сървър",
+        context_clear_old: "Споменавания, по-стари от един ден",
+        settings_stats: "Статистика",
+        stats_text: "Отбелязани като прочетени: сървъри {servers}, лични съобщения {dms} · Изчистени споменавания: {mentions}",
+        button_reset: "Нулиране",
+        toast_noMentions: "Няма подходящи споменавания",
     },
     cs: {
         context_unreadguilds: "Nepřečtené servery",
@@ -1124,7 +1416,6 @@ const labels = {
         settings_extras: "Doplňky",
         settings_blacklist: "Černá listina serverů",
         set_addClearButton: "Přidá do okna zmínek tlačítko, které odebere všechny zmínky",
-        set_confirmClear: "Ptát se na potvrzení před označením nebo odebráním",
         set_guilds: "Nepřečtené servery",
         set_muted: "Ztlumené servery",
         set_dms: "Přímé zprávy se zmínkami",
@@ -1162,6 +1453,34 @@ const labels = {
         channels_none: "Žádné",
         button_clear: "Odebrat vše",
         tooltip_more: "+{n} dalších",
+        set_confirm: "Ptát se před označením nebo vymazáním",
+        confirm_never: "Nikdy",
+        confirm_always: "Vždy",
+        confirm_from: "Od {n} najednou",
+        set_clearMarksRead: "Vymazání zmínek označí i jejich kanály jako přečtené",
+        set_checkUpdates: "Hledat aktualizace",
+        note_checkUpdates: "Hledá novou verzi na GitHubu a nabídne instalaci jedním kliknutím.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} je k dispozici.",
+        button_update: "Aktualizovat",
+        toast_updated: "Aktualizováno na {version}",
+        toast_updateFailed: "Aktualizace selhala: {error}",
+        set_buttonStyle: "Styl tlačítka",
+        style_text: "Text",
+        style_icon: "Ikona",
+        style_both: "Ikona a text",
+        set_readOnLeave: "Označit server jako přečtený při přepnutí na jiný",
+        set_activeFrom: "Automatické čtení od",
+        set_activeTo: "Automatické čtení do",
+        note_activeHours: "Platí pro interval, ztlumené servery a spuštění. Stejná hodina nebo „Kdykoli“ znamená vždy.",
+        hours_any: "Kdykoli",
+        set_clearHotkey: "Klávesová zkratka pro vymazání zmínek",
+        context_clear_all: "Všechny zmínky",
+        context_clear_server: "Zmínky z tohoto serveru",
+        context_clear_old: "Zmínky starší než jeden den",
+        settings_stats: "Statistika",
+        stats_text: "Označeno jako přečtené: serverů {servers}, přímých zpráv {dms} · Vymazáno zmínek: {mentions}",
+        button_reset: "Vynulovat",
+        toast_noMentions: "Žádné odpovídající zmínky",
     },
     da: {
         context_unreadguilds: "Ulæste servere",
@@ -1188,7 +1507,6 @@ const labels = {
         settings_extras: "Ekstra",
         settings_blacklist: "Sortliste over servere",
         set_addClearButton: "Tilføjer en knap i omtalevinduet, der fjerner alle omtaler",
-        set_confirmClear: "Beder om bekræftelse før markering eller fjernelse",
         set_guilds: "Ulæste servere",
         set_muted: "Lydløse servere",
         set_dms: "Direkte beskeder med omtaler",
@@ -1226,6 +1544,34 @@ const labels = {
         channels_none: "Ingen",
         button_clear: "Fjern alle",
         tooltip_more: "+{n} mere",
+        set_confirm: "Spørg før markering eller rydning",
+        confirm_never: "Aldrig",
+        confirm_always: "Altid",
+        confirm_from: "Fra {n} ad gangen",
+        set_clearMarksRead: "Rydning af omtaler markerer også deres kanaler som læst",
+        set_checkUpdates: "Søg efter opdateringer",
+        note_checkUpdates: "Søger efter en ny version på GitHub og tilbyder at installere den med ét klik.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} er tilgængelig.",
+        button_update: "Opdater",
+        toast_updated: "Opdateret til {version}",
+        toast_updateFailed: "Opdatering mislykkedes: {error}",
+        set_buttonStyle: "Knappens stil",
+        style_text: "Tekst",
+        style_icon: "Ikon",
+        style_both: "Ikon og tekst",
+        set_readOnLeave: "Marker en server som læst, når du skifter til en anden",
+        set_activeFrom: "Automatisk læsning fra",
+        set_activeTo: "Automatisk læsning indtil",
+        note_activeHours: "Gælder for intervallet, lydløse servere og opstart. Samme time eller \"Når som helst\" betyder altid.",
+        hours_any: "Når som helst",
+        set_clearHotkey: "Genvejstast til rydning af omtaler",
+        context_clear_all: "Alle omtaler",
+        context_clear_server: "Omtaler fra denne server",
+        context_clear_old: "Omtaler ældre end en dag",
+        settings_stats: "Statistik",
+        stats_text: "Markeret som læst: {servers} servere, {dms} direkte beskeder · Omtaler ryddet: {mentions}",
+        button_reset: "Nulstil",
+        toast_noMentions: "Ingen matchende omtaler",
     },
     el: {
         context_unreadguilds: "Μη αναγνωσμένοι διακομιστές",
@@ -1252,7 +1598,6 @@ const labels = {
         settings_extras: "Επιπλέον",
         settings_blacklist: "Μαύρη λίστα διακομιστών",
         set_addClearButton: "Προσθέτει στο παράθυρο αναφορών κουμπί που τις αφαιρεί όλες",
-        set_confirmClear: "Ζητά επιβεβαίωση πριν από επισήμανση ή αφαίρεση",
         set_guilds: "Μη αναγνωσμένοι διακομιστές",
         set_muted: "Διακομιστές σε σίγαση",
         set_dms: "Άμεσα μηνύματα με αναφορές",
@@ -1290,6 +1635,34 @@ const labels = {
         channels_none: "Κανένα",
         button_clear: "Αφαίρεση όλων",
         tooltip_more: "+{n} ακόμη",
+        set_confirm: "Ερώτηση πριν από σήμανση ή εκκαθάριση",
+        confirm_never: "Ποτέ",
+        confirm_always: "Πάντα",
+        confirm_from: "Από {n} μαζί",
+        set_clearMarksRead: "Η εκκαθάριση αναφορών επισημαίνει και τα κανάλια τους ως αναγνωσμένα",
+        set_checkUpdates: "Έλεγχος για ενημερώσεις",
+        note_checkUpdates: "Αναζητά νέα έκδοση στο GitHub και προτείνει εγκατάσταση με ένα κλικ.",
+        notice_update: "Το ReadAllNotificationsButtonv2 {version} είναι διαθέσιμο.",
+        button_update: "Ενημέρωση",
+        toast_updated: "Ενημερώθηκε στην {version}",
+        toast_updateFailed: "Η ενημέρωση απέτυχε: {error}",
+        set_buttonStyle: "Στυλ κουμπιού",
+        style_text: "Κείμενο",
+        style_icon: "Εικονίδιο",
+        style_both: "Εικονίδιο και κείμενο",
+        set_readOnLeave: "Επισήμανση διακομιστή ως αναγνωσμένου όταν μεταβαίνετε σε άλλον",
+        set_activeFrom: "Αυτόματη ανάγνωση από",
+        set_activeTo: "Αυτόματη ανάγνωση έως",
+        note_activeHours: "Ισχύει για το διάστημα, τους διακομιστές σε σίγαση και την εκκίνηση. Ίδια ώρα ή «Οποτεδήποτε» σημαίνει πάντα.",
+        hours_any: "Οποτεδήποτε",
+        set_clearHotkey: "Συντόμευση για εκκαθάριση αναφορών",
+        context_clear_all: "Όλες οι αναφορές",
+        context_clear_server: "Αναφορές από αυτόν τον διακομιστή",
+        context_clear_old: "Αναφορές παλαιότερες από μία ημέρα",
+        settings_stats: "Στατιστικά",
+        stats_text: "Επισημάνθηκαν ως αναγνωσμένα: {servers} διακομιστές, {dms} άμεσα μηνύματα · Αναφορές που διαγράφηκαν: {mentions}",
+        button_reset: "Επαναφορά",
+        toast_noMentions: "Δεν υπάρχουν αντίστοιχες αναφορές",
     },
     es: {
         context_unreadguilds: "Servidores no leídos",
@@ -1316,7 +1689,6 @@ const labels = {
         settings_extras: "Extras",
         settings_blacklist: "Lista negra de servidores",
         set_addClearButton: "Añade un botón a la ventana de menciones que las quita todas",
-        set_confirmClear: "Pide confirmación antes de marcar o quitar",
         set_guilds: "Servidores no leídos",
         set_muted: "Servidores silenciados",
         set_dms: "Mensajes directos con menciones",
@@ -1354,6 +1726,34 @@ const labels = {
         channels_none: "Ninguno",
         button_clear: "Quitar todos",
         tooltip_more: "+{n} más",
+        set_confirm: "Preguntar antes de marcar o borrar",
+        confirm_never: "Nunca",
+        confirm_always: "Siempre",
+        confirm_from: "A partir de {n} a la vez",
+        set_clearMarksRead: "Borrar menciones también marca sus canales como leídos",
+        set_checkUpdates: "Buscar actualizaciones",
+        note_checkUpdates: "Busca una nueva versión en GitHub y ofrece instalarla con un clic.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} está disponible.",
+        button_update: "Actualizar",
+        toast_updated: "Actualizado a {version}",
+        toast_updateFailed: "Error al actualizar: {error}",
+        set_buttonStyle: "Estilo del botón",
+        style_text: "Texto",
+        style_icon: "Icono",
+        style_both: "Icono y texto",
+        set_readOnLeave: "Marcar un servidor como leído al cambiar a otro",
+        set_activeFrom: "Lectura automática desde",
+        set_activeTo: "Lectura automática hasta",
+        note_activeHours: "Se aplica al intervalo, a los servidores silenciados y al inicio. La misma hora o «Cualquier hora» significa siempre.",
+        hours_any: "Cualquier hora",
+        set_clearHotkey: "Atajo para borrar menciones",
+        context_clear_all: "Todas las menciones",
+        context_clear_server: "Menciones de este servidor",
+        context_clear_old: "Menciones de hace más de un día",
+        settings_stats: "Estadísticas",
+        stats_text: "Marcados como leídos: {servers} servidores, {dms} mensajes directos · Menciones borradas: {mentions}",
+        button_reset: "Restablecer",
+        toast_noMentions: "No hay menciones que coincidan",
     },
     fi: {
         context_unreadguilds: "Lukemattomat palvelimet",
@@ -1380,7 +1780,6 @@ const labels = {
         settings_extras: "Lisätoiminnot",
         settings_blacklist: "Palvelimien estolista",
         set_addClearButton: "Lisää mainintaikkunaan painikkeen, joka poistaa kaikki maininnat",
-        set_confirmClear: "Kysyy vahvistusta ennen merkitsemistä tai poistamista",
         set_guilds: "Lukemattomat palvelimet",
         set_muted: "Mykistetyt palvelimet",
         set_dms: "Yksityisviestit, joissa mainintoja",
@@ -1418,6 +1817,34 @@ const labels = {
         channels_none: "Ei yhtään",
         button_clear: "Poista kaikki",
         tooltip_more: "+{n} muuta",
+        set_confirm: "Kysy ennen merkitsemistä tai tyhjentämistä",
+        confirm_never: "Ei koskaan",
+        confirm_always: "Aina",
+        confirm_from: "Kun kerralla {n} tai enemmän",
+        set_clearMarksRead: "Mainintojen tyhjentäminen merkitsee myös niiden kanavat luetuiksi",
+        set_checkUpdates: "Tarkista päivitykset",
+        note_checkUpdates: "Etsii uutta versiota GitHubista ja tarjoaa asennusta yhdellä napsautuksella.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} on saatavilla.",
+        button_update: "Päivitä",
+        toast_updated: "Päivitetty versioon {version}",
+        toast_updateFailed: "Päivitys epäonnistui: {error}",
+        set_buttonStyle: "Painikkeen tyyli",
+        style_text: "Teksti",
+        style_icon: "Kuvake",
+        style_both: "Kuvake ja teksti",
+        set_readOnLeave: "Merkitse palvelin luetuksi, kun siirryt toiselle",
+        set_activeFrom: "Automaattinen lukeminen alkaa",
+        set_activeTo: "Automaattinen lukeminen päättyy",
+        note_activeHours: "Koskee aikaväliä, mykistettyjä palvelimia ja käynnistystä. Sama tunti tai \"Milloin tahansa\" tarkoittaa aina.",
+        hours_any: "Milloin tahansa",
+        set_clearHotkey: "Pikanäppäin mainintojen tyhjentämiseen",
+        context_clear_all: "Kaikki maininnat",
+        context_clear_server: "Maininnat tältä palvelimelta",
+        context_clear_old: "Yli päivän vanhat maininnat",
+        settings_stats: "Tilastot",
+        stats_text: "Merkitty luetuksi: {servers} palvelinta, {dms} yksityisviestiä · Tyhjennetyt maininnat: {mentions}",
+        button_reset: "Nollaa",
+        toast_noMentions: "Ei sopivia mainintoja",
     },
     fr: {
         context_unreadguilds: "Serveurs non lus",
@@ -1444,7 +1871,6 @@ const labels = {
         settings_extras: "Extras",
         settings_blacklist: "Liste noire des serveurs",
         set_addClearButton: "Ajoute un bouton dans la fenêtre des mentions pour toutes les supprimer",
-        set_confirmClear: "Demande une confirmation avant de marquer ou de supprimer",
         set_guilds: "Serveurs non lus",
         set_muted: "Serveurs en sourdine",
         set_dms: "Messages privés avec mentions",
@@ -1482,6 +1908,34 @@ const labels = {
         channels_none: "Aucun",
         button_clear: "Tout retirer",
         tooltip_more: "+{n} autres",
+        set_confirm: "Demander avant de marquer ou d'effacer",
+        confirm_never: "Jamais",
+        confirm_always: "Toujours",
+        confirm_from: "À partir de {n} à la fois",
+        set_clearMarksRead: "Effacer les mentions marque aussi leurs salons comme lus",
+        set_checkUpdates: "Rechercher des mises à jour",
+        note_checkUpdates: "Cherche une nouvelle version sur GitHub et propose de l'installer en un clic.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} est disponible.",
+        button_update: "Mettre à jour",
+        toast_updated: "Mis à jour vers {version}",
+        toast_updateFailed: "Échec de la mise à jour : {error}",
+        set_buttonStyle: "Style du bouton",
+        style_text: "Texte",
+        style_icon: "Icône",
+        style_both: "Icône et texte",
+        set_readOnLeave: "Marquer un serveur comme lu quand vous passez à un autre",
+        set_activeFrom: "Lecture automatique à partir de",
+        set_activeTo: "Lecture automatique jusqu'à",
+        note_activeHours: "S'applique à l'intervalle, aux serveurs en sourdine et au démarrage. La même heure ou « N'importe quand » signifie toujours.",
+        hours_any: "N'importe quand",
+        set_clearHotkey: "Raccourci pour effacer les mentions",
+        context_clear_all: "Toutes les mentions",
+        context_clear_server: "Mentions de ce serveur",
+        context_clear_old: "Mentions de plus d'un jour",
+        settings_stats: "Statistiques",
+        stats_text: "Marqués comme lus : {servers} serveurs, {dms} messages privés · Mentions effacées : {mentions}",
+        button_reset: "Réinitialiser",
+        toast_noMentions: "Aucune mention correspondante",
     },
     hi: {
         context_unreadguilds: "अपठित सर्वर",
@@ -1508,7 +1962,6 @@ const labels = {
         settings_extras: "अतिरिक्त",
         settings_blacklist: "सर्वर ब्लैकलिस्ट",
         set_addClearButton: "उल्लेख विंडो में सभी उल्लेख हटाने वाला बटन जोड़ता है",
-        set_confirmClear: "चिह्नित करने या हटाने से पहले पुष्टि माँगता है",
         set_guilds: "अपठित सर्वर",
         set_muted: "म्यूट किए गए सर्वर",
         set_dms: "उल्लेख वाले डायरेक्ट मैसेज",
@@ -1546,6 +1999,34 @@ const labels = {
         channels_none: "कोई नहीं",
         button_clear: "सभी हटाएँ",
         tooltip_more: "+{n} और",
+        set_confirm: "चिह्नित करने या हटाने से पहले पूछें",
+        confirm_never: "कभी नहीं",
+        confirm_always: "हमेशा",
+        confirm_from: "एक साथ {n} या अधिक होने पर",
+        set_clearMarksRead: "उल्लेख हटाने पर उनके चैनल भी पढ़े हुए चिह्नित होते हैं",
+        set_checkUpdates: "अपडेट की जाँच करें",
+        note_checkUpdates: "GitHub पर नया संस्करण खोजता है और एक क्लिक में इंस्टॉल करने का विकल्प देता है।",
+        notice_update: "ReadAllNotificationsButtonv2 {version} उपलब्ध है।",
+        button_update: "अपडेट करें",
+        toast_updated: "{version} पर अपडेट हो गया",
+        toast_updateFailed: "अपडेट विफल: {error}",
+        set_buttonStyle: "बटन की शैली",
+        style_text: "टेक्स्ट",
+        style_icon: "आइकन",
+        style_both: "आइकन और टेक्स्ट",
+        set_readOnLeave: "दूसरे सर्वर पर जाने पर सर्वर को पढ़ा हुआ चिह्नित करें",
+        set_activeFrom: "स्वचालित पढ़ना शुरू",
+        set_activeTo: "स्वचालित पढ़ना समाप्त",
+        note_activeHours: "अंतराल, म्यूट किए गए सर्वर और शुरुआत पर लागू होता है। एक ही घंटा या \"किसी भी समय\" का अर्थ है हमेशा।",
+        hours_any: "किसी भी समय",
+        set_clearHotkey: "उल्लेख हटाने का शॉर्टकट",
+        context_clear_all: "सभी उल्लेख",
+        context_clear_server: "इस सर्वर के उल्लेख",
+        context_clear_old: "एक दिन से पुराने उल्लेख",
+        settings_stats: "आँकड़े",
+        stats_text: "पढ़ा हुआ चिह्नित: {servers} सर्वर, {dms} डायरेक्ट मैसेज · हटाए गए उल्लेख: {mentions}",
+        button_reset: "रीसेट करें",
+        toast_noMentions: "कोई मिलता-जुलता उल्लेख नहीं",
     },
     hr: {
         context_unreadguilds: "Nepročitani poslužitelji",
@@ -1572,7 +2053,6 @@ const labels = {
         settings_extras: "Dodaci",
         settings_blacklist: "Crna lista poslužitelja",
         set_addClearButton: "Dodaje u prozor spominjanja gumb koji uklanja sva spominjanja",
-        set_confirmClear: "Traži potvrdu prije označavanja ili uklanjanja",
         set_guilds: "Nepročitani poslužitelji",
         set_muted: "Utišani poslužitelji",
         set_dms: "Izravne poruke sa spominjanjima",
@@ -1610,6 +2090,34 @@ const labels = {
         channels_none: "Nema",
         button_clear: "Ukloni sve",
         tooltip_more: "+{n} više",
+        set_confirm: "Pitaj prije označavanja ili brisanja",
+        confirm_never: "Nikad",
+        confirm_always: "Uvijek",
+        confirm_from: "Od {n} odjednom",
+        set_clearMarksRead: "Brisanje spominjanja označava i njihove kanale kao pročitane",
+        set_checkUpdates: "Provjeravaj ažuriranja",
+        note_checkUpdates: "Traži novu verziju na GitHubu i nudi instalaciju jednim klikom.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} je dostupan.",
+        button_update: "Ažuriraj",
+        toast_updated: "Ažurirano na {version}",
+        toast_updateFailed: "Ažuriranje nije uspjelo: {error}",
+        set_buttonStyle: "Stil gumba",
+        style_text: "Tekst",
+        style_icon: "Ikona",
+        style_both: "Ikona i tekst",
+        set_readOnLeave: "Označi poslužitelj kao pročitan kad prijeđeš na drugi",
+        set_activeFrom: "Automatsko čitanje od",
+        set_activeTo: "Automatsko čitanje do",
+        note_activeHours: "Vrijedi za interval, utišane poslužitelje i pokretanje. Isti sat ili „Bilo kada” znači uvijek.",
+        hours_any: "Bilo kada",
+        set_clearHotkey: "Prečac za brisanje spominjanja",
+        context_clear_all: "Sva spominjanja",
+        context_clear_server: "Spominjanja s ovog poslužitelja",
+        context_clear_old: "Spominjanja starija od jednog dana",
+        settings_stats: "Statistika",
+        stats_text: "Označeno kao pročitano: poslužitelja {servers}, izravnih poruka {dms} · Obrisano spominjanja: {mentions}",
+        button_reset: "Poništi",
+        toast_noMentions: "Nema odgovarajućih spominjanja",
     },
     hu: {
         context_unreadguilds: "Olvasatlan szerverek",
@@ -1636,7 +2144,6 @@ const labels = {
         settings_extras: "Extrák",
         settings_blacklist: "Szerverek tiltólistája",
         set_addClearButton: "Gombot ad az említések ablakhoz, amely minden említést eltávolít",
-        set_confirmClear: "Megerősítést kér jelölés vagy eltávolítás előtt",
         set_guilds: "Olvasatlan szerverek",
         set_muted: "Némított szerverek",
         set_dms: "Közvetlen üzenetek említéssel",
@@ -1674,6 +2181,34 @@ const labels = {
         channels_none: "Nincs",
         button_clear: "Összes eltávolítása",
         tooltip_more: "+{n} további",
+        set_confirm: "Kérdezzen jelölés vagy törlés előtt",
+        confirm_never: "Soha",
+        confirm_always: "Mindig",
+        confirm_from: "Egyszerre {n} vagy több esetén",
+        set_clearMarksRead: "Az említések törlése a csatornáikat is olvasottnak jelöli",
+        set_checkUpdates: "Frissítések keresése",
+        note_checkUpdates: "Új verziót keres a GitHubon, és felajánlja a telepítését egy kattintással.",
+        notice_update: "Elérhető a ReadAllNotificationsButtonv2 {version}.",
+        button_update: "Frissítés",
+        toast_updated: "Frissítve erre: {version}",
+        toast_updateFailed: "A frissítés sikertelen: {error}",
+        set_buttonStyle: "Gomb stílusa",
+        style_text: "Szöveg",
+        style_icon: "Ikon",
+        style_both: "Ikon és szöveg",
+        set_readOnLeave: "Szerver olvasottnak jelölése, amikor másikra váltasz",
+        set_activeFrom: "Automatikus olvasás ettől",
+        set_activeTo: "Automatikus olvasás eddig",
+        note_activeHours: "Az időközre, a némított szerverekre és az indításra vonatkozik. Azonos óra vagy „Bármikor” azt jelenti: mindig.",
+        hours_any: "Bármikor",
+        set_clearHotkey: "Billentyűparancs az említések törléséhez",
+        context_clear_all: "Összes említés",
+        context_clear_server: "Említések erről a szerverről",
+        context_clear_old: "Egy napnál régebbi említések",
+        settings_stats: "Statisztika",
+        stats_text: "Olvasottnak jelölve: {servers} szerver, {dms} közvetlen üzenet · Törölt említések: {mentions}",
+        button_reset: "Visszaállítás",
+        toast_noMentions: "Nincs megfelelő említés",
     },
     id: {
         context_unreadguilds: "Server belum dibaca",
@@ -1700,7 +2235,6 @@ const labels = {
         settings_extras: "Tambahan",
         settings_blacklist: "Daftar hitam server",
         set_addClearButton: "Menambahkan tombol di jendela sebutan untuk menghapus semua sebutan",
-        set_confirmClear: "Meminta konfirmasi sebelum menandai atau menghapus",
         set_guilds: "Server belum dibaca",
         set_muted: "Server yang dibisukan",
         set_dms: "Pesan langsung dengan sebutan",
@@ -1738,6 +2272,34 @@ const labels = {
         channels_none: "Tidak ada",
         button_clear: "Hapus semua",
         tooltip_more: "+{n} lainnya",
+        set_confirm: "Tanya sebelum menandai atau menghapus",
+        confirm_never: "Tidak pernah",
+        confirm_always: "Selalu",
+        confirm_from: "Mulai {n} sekaligus",
+        set_clearMarksRead: "Menghapus sebutan juga menandai salurannya sebagai sudah dibaca",
+        set_checkUpdates: "Periksa pembaruan",
+        note_checkUpdates: "Mencari versi baru di GitHub dan menawarkan pemasangan dengan satu klik.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} tersedia.",
+        button_update: "Perbarui",
+        toast_updated: "Diperbarui ke {version}",
+        toast_updateFailed: "Pembaruan gagal: {error}",
+        set_buttonStyle: "Gaya tombol",
+        style_text: "Teks",
+        style_icon: "Ikon",
+        style_both: "Ikon dan teks",
+        set_readOnLeave: "Tandai server sebagai sudah dibaca saat pindah ke server lain",
+        set_activeFrom: "Baca otomatis mulai",
+        set_activeTo: "Baca otomatis sampai",
+        note_activeHours: "Berlaku untuk interval, server yang dibisukan, dan saat mulai. Jam yang sama atau \"Kapan saja\" berarti selalu.",
+        hours_any: "Kapan saja",
+        set_clearHotkey: "Pintasan untuk menghapus sebutan",
+        context_clear_all: "Semua sebutan",
+        context_clear_server: "Sebutan dari server ini",
+        context_clear_old: "Sebutan yang lebih lama dari satu hari",
+        settings_stats: "Statistik",
+        stats_text: "Ditandai sudah dibaca: {servers} server, {dms} pesan langsung · Sebutan dihapus: {mentions}",
+        button_reset: "Atur ulang",
+        toast_noMentions: "Tidak ada sebutan yang cocok",
     },
     it: {
         context_unreadguilds: "Server non letti",
@@ -1764,7 +2326,6 @@ const labels = {
         settings_extras: "Extra",
         settings_blacklist: "Lista nera dei server",
         set_addClearButton: "Aggiunge un pulsante alla finestra delle menzioni che le rimuove tutte",
-        set_confirmClear: "Chiede conferma prima di segnare o rimuovere",
         set_guilds: "Server non letti",
         set_muted: "Server silenziati",
         set_dms: "Messaggi diretti con menzioni",
@@ -1802,6 +2363,34 @@ const labels = {
         channels_none: "Nessuno",
         button_clear: "Rimuovi tutti",
         tooltip_more: "+{n} altri",
+        set_confirm: "Chiedi prima di segnare o cancellare",
+        confirm_never: "Mai",
+        confirm_always: "Sempre",
+        confirm_from: "Da {n} alla volta",
+        set_clearMarksRead: "Cancellare le menzioni segna anche i loro canali come letti",
+        set_checkUpdates: "Cerca aggiornamenti",
+        note_checkUpdates: "Cerca una nuova versione su GitHub e propone di installarla con un clic.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} è disponibile.",
+        button_update: "Aggiorna",
+        toast_updated: "Aggiornato a {version}",
+        toast_updateFailed: "Aggiornamento non riuscito: {error}",
+        set_buttonStyle: "Stile del pulsante",
+        style_text: "Testo",
+        style_icon: "Icona",
+        style_both: "Icona e testo",
+        set_readOnLeave: "Segna un server come letto quando passi a un altro",
+        set_activeFrom: "Lettura automatica dalle",
+        set_activeTo: "Lettura automatica fino alle",
+        note_activeHours: "Vale per l'intervallo, i server silenziati e l'avvio. La stessa ora o «Qualsiasi ora» significa sempre.",
+        hours_any: "Qualsiasi ora",
+        set_clearHotkey: "Scorciatoia per cancellare le menzioni",
+        context_clear_all: "Tutte le menzioni",
+        context_clear_server: "Menzioni da questo server",
+        context_clear_old: "Menzioni più vecchie di un giorno",
+        settings_stats: "Statistiche",
+        stats_text: "Segnati come letti: {servers} server, {dms} messaggi diretti · Menzioni cancellate: {mentions}",
+        button_reset: "Reimposta",
+        toast_noMentions: "Nessuna menzione corrispondente",
     },
     ja: {
         context_unreadguilds: "未読のサーバー",
@@ -1828,7 +2417,6 @@ const labels = {
         settings_extras: "追加機能",
         settings_blacklist: "サーバーのブラックリスト",
         set_addClearButton: "メンション一覧にすべてのメンションを削除するボタンを追加",
-        set_confirmClear: "既読化や削除の前に確認する",
         set_guilds: "未読のサーバー",
         set_muted: "ミュート中のサーバー",
         set_dms: "メンションのあるダイレクトメッセージ",
@@ -1866,6 +2454,34 @@ const labels = {
         channels_none: "なし",
         button_clear: "すべて解除",
         tooltip_more: "ほか {n} 件",
+        set_confirm: "既読にする前や削除する前に確認する",
+        confirm_never: "しない",
+        confirm_always: "常に",
+        confirm_from: "一度に{n}件以上のとき",
+        set_clearMarksRead: "メンションを削除するとそのチャンネルも既読にする",
+        set_checkUpdates: "アップデートを確認",
+        note_checkUpdates: "GitHubで新しいバージョンを探し、ワンクリックでのインストールを提案します。",
+        notice_update: "ReadAllNotificationsButtonv2 {version} が利用可能です。",
+        button_update: "アップデート",
+        toast_updated: "{version} にアップデートしました",
+        toast_updateFailed: "アップデートに失敗しました: {error}",
+        set_buttonStyle: "ボタンのスタイル",
+        style_text: "テキスト",
+        style_icon: "アイコン",
+        style_both: "アイコンとテキスト",
+        set_readOnLeave: "別のサーバーに移動したときに既読にする",
+        set_activeFrom: "自動既読の開始",
+        set_activeTo: "自動既読の終了",
+        note_activeHours: "間隔、ミュート中のサーバー、起動時に適用されます。同じ時刻または「いつでも」は常に有効です。",
+        hours_any: "いつでも",
+        set_clearHotkey: "メンション削除のキー割り当て",
+        context_clear_all: "すべてのメンション",
+        context_clear_server: "このサーバーのメンション",
+        context_clear_old: "1日以上前のメンション",
+        settings_stats: "統計",
+        stats_text: "既読にした数: サーバー {servers}、DM {dms} · 削除したメンション: {mentions}",
+        button_reset: "リセット",
+        toast_noMentions: "該当するメンションはありません",
     },
     ko: {
         context_unreadguilds: "읽지 않은 서버",
@@ -1892,7 +2508,6 @@ const labels = {
         settings_extras: "추가 기능",
         settings_blacklist: "서버 블랙리스트",
         set_addClearButton: "멘션 창에 모든 멘션을 삭제하는 버튼을 추가합니다",
-        set_confirmClear: "읽음 표시나 삭제 전에 확인합니다",
         set_guilds: "읽지 않은 서버",
         set_muted: "알림 끈 서버",
         set_dms: "멘션이 있는 다이렉트 메시지",
@@ -1930,6 +2545,34 @@ const labels = {
         channels_none: "없음",
         button_clear: "모두 해제",
         tooltip_more: "외 {n}개",
+        set_confirm: "읽음 표시 또는 삭제 전에 확인",
+        confirm_never: "안 함",
+        confirm_always: "항상",
+        confirm_from: "한 번에 {n}개 이상일 때",
+        set_clearMarksRead: "멘션을 삭제하면 해당 채널도 읽음으로 표시",
+        set_checkUpdates: "업데이트 확인",
+        note_checkUpdates: "GitHub에서 새 버전을 찾아 클릭 한 번으로 설치하도록 안내합니다.",
+        notice_update: "ReadAllNotificationsButtonv2 {version}을(를) 사용할 수 있습니다.",
+        button_update: "업데이트",
+        toast_updated: "{version}(으)로 업데이트했습니다",
+        toast_updateFailed: "업데이트 실패: {error}",
+        set_buttonStyle: "버튼 스타일",
+        style_text: "텍스트",
+        style_icon: "아이콘",
+        style_both: "아이콘과 텍스트",
+        set_readOnLeave: "다른 서버로 이동할 때 이전 서버를 읽음으로 표시",
+        set_activeFrom: "자동 읽음 시작",
+        set_activeTo: "자동 읽음 종료",
+        note_activeHours: "간격, 알림 끈 서버, 시작 시에 적용됩니다. 같은 시간이나 \"언제나\"는 항상을 뜻합니다.",
+        hours_any: "언제나",
+        set_clearHotkey: "멘션 삭제 단축키",
+        context_clear_all: "모든 멘션",
+        context_clear_server: "이 서버의 멘션",
+        context_clear_old: "하루 이상 지난 멘션",
+        settings_stats: "통계",
+        stats_text: "읽음으로 표시: 서버 {servers}개, 다이렉트 메시지 {dms}개 · 삭제한 멘션: {mentions}개",
+        button_reset: "초기화",
+        toast_noMentions: "일치하는 멘션이 없습니다",
     },
     lt: {
         context_unreadguilds: "Neperskaityti serveriai",
@@ -1956,7 +2599,6 @@ const labels = {
         settings_extras: "Papildomai",
         settings_blacklist: "Serverių juodasis sąrašas",
         set_addClearButton: "Prideda paminėjimų lange mygtuką, kuris pašalina visus paminėjimus",
-        set_confirmClear: "Prašo patvirtinimo prieš žymint ar šalinant",
         set_guilds: "Neperskaityti serveriai",
         set_muted: "Nutildyti serveriai",
         set_dms: "Asmeninės žinutės su paminėjimais",
@@ -1994,6 +2636,34 @@ const labels = {
         channels_none: "Nėra",
         button_clear: "Pašalinti visus",
         tooltip_more: "+{n} daugiau",
+        set_confirm: "Klausti prieš žymint ar išvalant",
+        confirm_never: "Niekada",
+        confirm_always: "Visada",
+        confirm_from: "Nuo {n} vienu metu",
+        set_clearMarksRead: "Išvalius paminėjimus, jų kanalai taip pat pažymimi kaip perskaityti",
+        set_checkUpdates: "Tikrinti atnaujinimus",
+        note_checkUpdates: "Ieško naujos versijos „GitHub“ ir pasiūlo ją įdiegti vienu spustelėjimu.",
+        notice_update: "Galima ReadAllNotificationsButtonv2 {version} versija.",
+        button_update: "Atnaujinti",
+        toast_updated: "Atnaujinta į {version}",
+        toast_updateFailed: "Atnaujinti nepavyko: {error}",
+        set_buttonStyle: "Mygtuko stilius",
+        style_text: "Tekstas",
+        style_icon: "Piktograma",
+        style_both: "Piktograma ir tekstas",
+        set_readOnLeave: "Pažymėti serverį kaip perskaitytą, kai pereinate į kitą",
+        set_activeFrom: "Automatinis skaitymas nuo",
+        set_activeTo: "Automatinis skaitymas iki",
+        note_activeHours: "Taikoma intervalui, nutildytiems serveriams ir paleidimui. Ta pati valanda arba „Bet kada“ reiškia visada.",
+        hours_any: "Bet kada",
+        set_clearHotkey: "Spartusis klavišas paminėjimams išvalyti",
+        context_clear_all: "Visi paminėjimai",
+        context_clear_server: "Paminėjimai iš šio serverio",
+        context_clear_old: "Senesni nei vienos dienos paminėjimai",
+        settings_stats: "Statistika",
+        stats_text: "Pažymėta kaip perskaityta: serverių {servers}, asmeninių žinučių {dms} · Išvalyta paminėjimų: {mentions}",
+        button_reset: "Nustatyti iš naujo",
+        toast_noMentions: "Tinkamų paminėjimų nėra",
     },
     nl: {
         context_unreadguilds: "Ongelezen servers",
@@ -2020,7 +2690,6 @@ const labels = {
         settings_extras: "Extra's",
         settings_blacklist: "Zwarte lijst van servers",
         set_addClearButton: "Voegt een knop toe aan het vermeldingenvenster die alle vermeldingen verwijdert",
-        set_confirmClear: "Vraagt om bevestiging voor het markeren of verwijderen",
         set_guilds: "Ongelezen servers",
         set_muted: "Gedempte servers",
         set_dms: "Privéberichten met vermeldingen",
@@ -2058,6 +2727,34 @@ const labels = {
         channels_none: "Geen",
         button_clear: "Alles verwijderen",
         tooltip_more: "+{n} meer",
+        set_confirm: "Vragen voor markeren of wissen",
+        confirm_never: "Nooit",
+        confirm_always: "Altijd",
+        confirm_from: "Vanaf {n} tegelijk",
+        set_clearMarksRead: "Vermeldingen wissen markeert ook hun kanalen als gelezen",
+        set_checkUpdates: "Zoeken naar updates",
+        note_checkUpdates: "Zoekt op GitHub naar een nieuwe versie en biedt aan die met één klik te installeren.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} is beschikbaar.",
+        button_update: "Bijwerken",
+        toast_updated: "Bijgewerkt naar {version}",
+        toast_updateFailed: "Bijwerken mislukt: {error}",
+        set_buttonStyle: "Stijl van de knop",
+        style_text: "Tekst",
+        style_icon: "Pictogram",
+        style_both: "Pictogram en tekst",
+        set_readOnLeave: "Een server als gelezen markeren wanneer je naar een andere gaat",
+        set_activeFrom: "Automatisch lezen vanaf",
+        set_activeTo: "Automatisch lezen tot",
+        note_activeHours: "Geldt voor het interval, gedempte servers en het opstarten. Hetzelfde uur of 'Elk tijdstip' betekent altijd.",
+        hours_any: "Elk tijdstip",
+        set_clearHotkey: "Sneltoets voor het wissen van vermeldingen",
+        context_clear_all: "Alle vermeldingen",
+        context_clear_server: "Vermeldingen uit deze server",
+        context_clear_old: "Vermeldingen ouder dan een dag",
+        settings_stats: "Statistieken",
+        stats_text: "Als gelezen gemarkeerd: {servers} servers, {dms} privéberichten · Vermeldingen gewist: {mentions}",
+        button_reset: "Herstellen",
+        toast_noMentions: "Geen passende vermeldingen",
     },
     no: {
         context_unreadguilds: "Uleste servere",
@@ -2084,7 +2781,6 @@ const labels = {
         settings_extras: "Ekstra",
         settings_blacklist: "Svarteliste for servere",
         set_addClearButton: "Legger til en knapp i omtalevinduet som fjerner alle omtaler",
-        set_confirmClear: "Ber om bekreftelse før merking eller fjerning",
         set_guilds: "Uleste servere",
         set_muted: "Dempede servere",
         set_dms: "Direktemeldinger med omtaler",
@@ -2122,6 +2818,34 @@ const labels = {
         channels_none: "Ingen",
         button_clear: "Fjern alle",
         tooltip_more: "+{n} til",
+        set_confirm: "Spør før markering eller tømming",
+        confirm_never: "Aldri",
+        confirm_always: "Alltid",
+        confirm_from: "Fra {n} om gangen",
+        set_clearMarksRead: "Tømming av omtaler markerer også kanalene deres som lest",
+        set_checkUpdates: "Se etter oppdateringer",
+        note_checkUpdates: "Ser etter en ny versjon på GitHub og tilbyr å installere den med ett klikk.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} er tilgjengelig.",
+        button_update: "Oppdater",
+        toast_updated: "Oppdatert til {version}",
+        toast_updateFailed: "Oppdateringen mislyktes: {error}",
+        set_buttonStyle: "Knappestil",
+        style_text: "Tekst",
+        style_icon: "Ikon",
+        style_both: "Ikon og tekst",
+        set_readOnLeave: "Merk en server som lest når du bytter til en annen",
+        set_activeFrom: "Automatisk lesing fra",
+        set_activeTo: "Automatisk lesing til",
+        note_activeHours: "Gjelder intervallet, dempede servere og oppstart. Samme time eller «Når som helst» betyr alltid.",
+        hours_any: "Når som helst",
+        set_clearHotkey: "Hurtigtast for å tømme omtaler",
+        context_clear_all: "Alle omtaler",
+        context_clear_server: "Omtaler fra denne serveren",
+        context_clear_old: "Omtaler eldre enn én dag",
+        settings_stats: "Statistikk",
+        stats_text: "Markert som lest: {servers} servere, {dms} direktemeldinger · Omtaler tømt: {mentions}",
+        button_reset: "Tilbakestill",
+        toast_noMentions: "Ingen omtaler som passer",
     },
     pl: {
         context_unreadguilds: "Nieprzeczytane serwery",
@@ -2148,7 +2872,6 @@ const labels = {
         settings_extras: "Dodatki",
         settings_blacklist: "Czarna lista serwerów",
         set_addClearButton: "Dodaje do okna wzmianek przycisk, który usuwa wszystkie wzmianki",
-        set_confirmClear: "Pyta o potwierdzenie przed oznaczeniem lub usunięciem",
         set_guilds: "Nieprzeczytane serwery",
         set_muted: "Wyciszone serwery",
         set_dms: "Wiadomości prywatne ze wzmiankami",
@@ -2186,6 +2909,34 @@ const labels = {
         channels_none: "Brak",
         button_clear: "Usuń wszystkie",
         tooltip_more: "+{n} więcej",
+        set_confirm: "Pytaj przed oznaczaniem lub usuwaniem",
+        confirm_never: "Nigdy",
+        confirm_always: "Zawsze",
+        confirm_from: "Od {n} naraz",
+        set_clearMarksRead: "Usuwanie wzmianek oznacza też ich kanały jako przeczytane",
+        set_checkUpdates: "Sprawdzaj aktualizacje",
+        note_checkUpdates: "Szuka nowej wersji na GitHubie i proponuje instalację jednym kliknięciem.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} jest dostępny.",
+        button_update: "Aktualizuj",
+        toast_updated: "Zaktualizowano do {version}",
+        toast_updateFailed: "Aktualizacja nie powiodła się: {error}",
+        set_buttonStyle: "Styl przycisku",
+        style_text: "Tekst",
+        style_icon: "Ikona",
+        style_both: "Ikona i tekst",
+        set_readOnLeave: "Oznaczaj serwer jako przeczytany po przejściu na inny",
+        set_activeFrom: "Automatyczne czytanie od",
+        set_activeTo: "Automatyczne czytanie do",
+        note_activeHours: "Dotyczy interwału, wyciszonych serwerów i startu. Ta sama godzina lub „Dowolna pora” oznacza zawsze.",
+        hours_any: "Dowolna pora",
+        set_clearHotkey: "Skrót do usuwania wzmianek",
+        context_clear_all: "Wszystkie wzmianki",
+        context_clear_server: "Wzmianki z tego serwera",
+        context_clear_old: "Wzmianki starsze niż jeden dzień",
+        settings_stats: "Statystyki",
+        stats_text: "Oznaczono jako przeczytane: serwery {servers}, wiadomości prywatne {dms} · Usunięte wzmianki: {mentions}",
+        button_reset: "Resetuj",
+        toast_noMentions: "Brak pasujących wzmianek",
     },
     "pt-BR": {
         context_unreadguilds: "Servidores não lidos",
@@ -2212,7 +2963,6 @@ const labels = {
         settings_extras: "Extras",
         settings_blacklist: "Lista negra de servidores",
         set_addClearButton: "Adiciona um botão à janela de menções que remove todas",
-        set_confirmClear: "Pede confirmação antes de marcar ou remover",
         set_guilds: "Servidores não lidos",
         set_muted: "Servidores silenciados",
         set_dms: "Mensagens diretas com menções",
@@ -2250,6 +3000,34 @@ const labels = {
         channels_none: "Nenhum",
         button_clear: "Remover todos",
         tooltip_more: "+{n} outros",
+        set_confirm: "Perguntar antes de marcar ou limpar",
+        confirm_never: "Nunca",
+        confirm_always: "Sempre",
+        confirm_from: "A partir de {n} de uma vez",
+        set_clearMarksRead: "Limpar menções também marca os canais delas como lidos",
+        set_checkUpdates: "Procurar atualizações",
+        note_checkUpdates: "Procura uma nova versão no GitHub e oferece instalá-la com um clique.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} está disponível.",
+        button_update: "Atualizar",
+        toast_updated: "Atualizado para {version}",
+        toast_updateFailed: "Falha na atualização: {error}",
+        set_buttonStyle: "Estilo do botão",
+        style_text: "Texto",
+        style_icon: "Ícone",
+        style_both: "Ícone e texto",
+        set_readOnLeave: "Marcar um servidor como lido ao mudar para outro",
+        set_activeFrom: "Leitura automática a partir de",
+        set_activeTo: "Leitura automática até",
+        note_activeHours: "Vale para o intervalo, os servidores silenciados e a inicialização. O mesmo horário ou \"Qualquer hora\" significa sempre.",
+        hours_any: "Qualquer hora",
+        set_clearHotkey: "Atalho para limpar menções",
+        context_clear_all: "Todas as menções",
+        context_clear_server: "Menções deste servidor",
+        context_clear_old: "Menções com mais de um dia",
+        settings_stats: "Estatísticas",
+        stats_text: "Marcados como lidos: {servers} servidores, {dms} mensagens diretas · Menções limpas: {mentions}",
+        button_reset: "Redefinir",
+        toast_noMentions: "Nenhuma menção correspondente",
     },
     ro: {
         context_unreadguilds: "Servere necitite",
@@ -2276,7 +3054,6 @@ const labels = {
         settings_extras: "Extra",
         settings_blacklist: "Lista neagră de servere",
         set_addClearButton: "Adaugă în fereastra de mențiuni un buton care le elimină pe toate",
-        set_confirmClear: "Cere confirmare înainte de marcare sau eliminare",
         set_guilds: "Servere necitite",
         set_muted: "Servere fără sunet",
         set_dms: "Mesaje directe cu mențiuni",
@@ -2314,6 +3091,34 @@ const labels = {
         channels_none: "Niciunul",
         button_clear: "Elimină toate",
         tooltip_more: "+{n} în plus",
+        set_confirm: "Întreabă înainte de marcare sau ștergere",
+        confirm_never: "Niciodată",
+        confirm_always: "Întotdeauna",
+        confirm_from: "De la {n} deodată",
+        set_clearMarksRead: "Ștergerea mențiunilor marchează și canalele lor ca citite",
+        set_checkUpdates: "Caută actualizări",
+        note_checkUpdates: "Caută o versiune nouă pe GitHub și oferă instalarea cu un singur clic.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} este disponibil.",
+        button_update: "Actualizează",
+        toast_updated: "Actualizat la {version}",
+        toast_updateFailed: "Actualizarea a eșuat: {error}",
+        set_buttonStyle: "Stilul butonului",
+        style_text: "Text",
+        style_icon: "Pictogramă",
+        style_both: "Pictogramă și text",
+        set_readOnLeave: "Marchează un server ca citit când treci la altul",
+        set_activeFrom: "Citire automată de la",
+        set_activeTo: "Citire automată până la",
+        note_activeHours: "Se aplică intervalului, serverelor fără sunet și pornirii. Aceeași oră sau „Oricând” înseamnă mereu.",
+        hours_any: "Oricând",
+        set_clearHotkey: "Comandă rapidă pentru ștergerea mențiunilor",
+        context_clear_all: "Toate mențiunile",
+        context_clear_server: "Mențiuni de pe acest server",
+        context_clear_old: "Mențiuni mai vechi de o zi",
+        settings_stats: "Statistici",
+        stats_text: "Marcate ca citite: {servers} servere, {dms} mesaje directe · Mențiuni șterse: {mentions}",
+        button_reset: "Resetează",
+        toast_noMentions: "Nicio mențiune potrivită",
     },
     ru: {
         context_unreadguilds: "Непрочитанные серверы",
@@ -2340,7 +3145,6 @@ const labels = {
         settings_extras: "Дополнительно",
         settings_blacklist: "Чёрный список серверов",
         set_addClearButton: "Добавляет в окно упоминаний кнопку, удаляющую все упоминания",
-        set_confirmClear: "Запрашивать подтверждение перед отметкой или удалением",
         set_guilds: "Непрочитанные серверы",
         set_muted: "Заглушённые серверы",
         set_dms: "Личные сообщения с упоминаниями",
@@ -2378,6 +3182,34 @@ const labels = {
         channels_none: "Нет",
         button_clear: "Удалить все",
         tooltip_more: "+{n} ещё",
+        set_confirm: "Спрашивать перед отметкой или очисткой",
+        confirm_never: "Никогда",
+        confirm_always: "Всегда",
+        confirm_from: "От {n} за раз",
+        set_clearMarksRead: "Очистка упоминаний также отмечает их каналы прочитанными",
+        set_checkUpdates: "Проверять обновления",
+        note_checkUpdates: "Ищет новую версию на GitHub и предлагает установить её одним щелчком.",
+        notice_update: "Доступна версия ReadAllNotificationsButtonv2 {version}.",
+        button_update: "Обновить",
+        toast_updated: "Обновлено до {version}",
+        toast_updateFailed: "Не удалось обновить: {error}",
+        set_buttonStyle: "Вид кнопки",
+        style_text: "Текст",
+        style_icon: "Значок",
+        style_both: "Значок и текст",
+        set_readOnLeave: "Отмечать сервер прочитанным при переходе на другой",
+        set_activeFrom: "Автоматическое чтение с",
+        set_activeTo: "Автоматическое чтение до",
+        note_activeHours: "Действует для интервала, заглушённых серверов и запуска. Одинаковый час или «В любое время» означает всегда.",
+        hours_any: "В любое время",
+        set_clearHotkey: "Сочетание клавиш для очистки упоминаний",
+        context_clear_all: "Все упоминания",
+        context_clear_server: "Упоминания с этого сервера",
+        context_clear_old: "Упоминания старше одного дня",
+        settings_stats: "Статистика",
+        stats_text: "Отмечено прочитанным: серверов {servers}, личных сообщений {dms} · Удалено упоминаний: {mentions}",
+        button_reset: "Сбросить",
+        toast_noMentions: "Нет подходящих упоминаний",
     },
     "sv-SE": {
         context_unreadguilds: "Olästa servrar",
@@ -2404,7 +3236,6 @@ const labels = {
         settings_extras: "Extra",
         settings_blacklist: "Svartlista för servrar",
         set_addClearButton: "Lägger till en knapp i omnämnandefönstret som tar bort alla omnämnanden",
-        set_confirmClear: "Ber om bekräftelse innan markering eller borttagning",
         set_guilds: "Olästa servrar",
         set_muted: "Tystade servrar",
         set_dms: "Direktmeddelanden med omnämnanden",
@@ -2442,6 +3273,34 @@ const labels = {
         channels_none: "Inga",
         button_clear: "Ta bort alla",
         tooltip_more: "+{n} till",
+        set_confirm: "Fråga innan markering eller rensning",
+        confirm_never: "Aldrig",
+        confirm_always: "Alltid",
+        confirm_from: "Från {n} åt gången",
+        set_clearMarksRead: "Rensning av omnämnanden markerar även deras kanaler som lästa",
+        set_checkUpdates: "Sök efter uppdateringar",
+        note_checkUpdates: "Söker efter en ny version på GitHub och erbjuder installation med ett klick.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} finns tillgänglig.",
+        button_update: "Uppdatera",
+        toast_updated: "Uppdaterad till {version}",
+        toast_updateFailed: "Uppdateringen misslyckades: {error}",
+        set_buttonStyle: "Knappens stil",
+        style_text: "Text",
+        style_icon: "Ikon",
+        style_both: "Ikon och text",
+        set_readOnLeave: "Markera en server som läst när du byter till en annan",
+        set_activeFrom: "Automatisk läsning från",
+        set_activeTo: "Automatisk läsning till",
+        note_activeHours: "Gäller intervallet, tystade servrar och uppstarten. Samma timme eller ”När som helst” betyder alltid.",
+        hours_any: "När som helst",
+        set_clearHotkey: "Kortkommando för att rensa omnämnanden",
+        context_clear_all: "Alla omnämnanden",
+        context_clear_server: "Omnämnanden från den här servern",
+        context_clear_old: "Omnämnanden äldre än en dag",
+        settings_stats: "Statistik",
+        stats_text: "Markerade som lästa: {servers} servrar, {dms} direktmeddelanden · Rensade omnämnanden: {mentions}",
+        button_reset: "Återställ",
+        toast_noMentions: "Inga matchande omnämnanden",
     },
     th: {
         context_unreadguilds: "เซิร์ฟเวอร์ที่ยังไม่ได้อ่าน",
@@ -2468,7 +3327,6 @@ const labels = {
         settings_extras: "ฟีเจอร์เพิ่มเติม",
         settings_blacklist: "บัญชีดำเซิร์ฟเวอร์",
         set_addClearButton: "เพิ่มปุ่มในหน้าต่างการกล่าวถึงเพื่อลบการกล่าวถึงทั้งหมด",
-        set_confirmClear: "ขอการยืนยันก่อนทำเครื่องหมายหรือลบ",
         set_guilds: "เซิร์ฟเวอร์ที่ยังไม่ได้อ่าน",
         set_muted: "เซิร์ฟเวอร์ที่ปิดเสียง",
         set_dms: "ข้อความส่วนตัวที่มีการกล่าวถึง",
@@ -2506,6 +3364,34 @@ const labels = {
         channels_none: "ไม่มี",
         button_clear: "ลบทั้งหมด",
         tooltip_more: "+อีก {n}",
+        set_confirm: "ถามก่อนทำเครื่องหมายหรือล้าง",
+        confirm_never: "ไม่ถาม",
+        confirm_always: "ถามทุกครั้ง",
+        confirm_from: "เมื่อมีตั้งแต่ {n} รายการพร้อมกัน",
+        set_clearMarksRead: "การล้างการกล่าวถึงจะทำเครื่องหมายช่องของรายการนั้นว่าอ่านแล้วด้วย",
+        set_checkUpdates: "ตรวจหาอัปเดต",
+        note_checkUpdates: "ค้นหาเวอร์ชันใหม่บน GitHub และเสนอให้ติดตั้งด้วยการคลิกเดียว",
+        notice_update: "ReadAllNotificationsButtonv2 {version} พร้อมใช้งานแล้ว",
+        button_update: "อัปเดต",
+        toast_updated: "อัปเดตเป็น {version} แล้ว",
+        toast_updateFailed: "อัปเดตไม่สำเร็จ: {error}",
+        set_buttonStyle: "รูปแบบปุ่ม",
+        style_text: "ข้อความ",
+        style_icon: "ไอคอน",
+        style_both: "ไอคอนและข้อความ",
+        set_readOnLeave: "ทำเครื่องหมายเซิร์ฟเวอร์ว่าอ่านแล้วเมื่อสลับไปเซิร์ฟเวอร์อื่น",
+        set_activeFrom: "อ่านอัตโนมัติตั้งแต่",
+        set_activeTo: "อ่านอัตโนมัติจนถึง",
+        note_activeHours: "ใช้กับช่วงเวลา เซิร์ฟเวอร์ที่ปิดเสียง และตอนเริ่มต้น ชั่วโมงเดียวกันหรือ \"เวลาใดก็ได้\" หมายถึงตลอดเวลา",
+        hours_any: "เวลาใดก็ได้",
+        set_clearHotkey: "ปุ่มลัดสำหรับล้างการกล่าวถึง",
+        context_clear_all: "การกล่าวถึงทั้งหมด",
+        context_clear_server: "การกล่าวถึงจากเซิร์ฟเวอร์นี้",
+        context_clear_old: "การกล่าวถึงที่เก่ากว่าหนึ่งวัน",
+        settings_stats: "สถิติ",
+        stats_text: "ทำเครื่องหมายว่าอ่านแล้ว: {servers} เซิร์ฟเวอร์, {dms} ข้อความส่วนตัว · ล้างการกล่าวถึง: {mentions}",
+        button_reset: "รีเซ็ต",
+        toast_noMentions: "ไม่มีการกล่าวถึงที่ตรงกัน",
     },
     tr: {
         context_unreadguilds: "Okunmamış Sunucular",
@@ -2532,7 +3418,6 @@ const labels = {
         settings_extras: "Ekstralar",
         settings_blacklist: "Sunucu kara listesi",
         set_addClearButton: "Bahsetmeler penceresine tüm bahsetmeleri kaldıran bir düğme ekler",
-        set_confirmClear: "İşaretlemeden veya kaldırmadan önce onay ister",
         set_guilds: "Okunmamış sunucular",
         set_muted: "Sessize alınan sunucular",
         set_dms: "Bahsetme içeren doğrudan mesajlar",
@@ -2570,6 +3455,34 @@ const labels = {
         channels_none: "Yok",
         button_clear: "Tümünü kaldır",
         tooltip_more: "+{n} daha",
+        set_confirm: "İşaretlemeden veya temizlemeden önce sor",
+        confirm_never: "Asla",
+        confirm_always: "Her zaman",
+        confirm_from: "Tek seferde {n} veya daha fazlaysa",
+        set_clearMarksRead: "Bahsetmeleri temizlemek kanallarını da okundu olarak işaretler",
+        set_checkUpdates: "Güncellemeleri denetle",
+        note_checkUpdates: "GitHub'da yeni sürüm arar ve tek tıkla yüklemeyi önerir.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} kullanılabilir.",
+        button_update: "Güncelle",
+        toast_updated: "{version} sürümüne güncellendi",
+        toast_updateFailed: "Güncelleme başarısız: {error}",
+        set_buttonStyle: "Düğme stili",
+        style_text: "Metin",
+        style_icon: "Simge",
+        style_both: "Simge ve metin",
+        set_readOnLeave: "Başka bir sunucuya geçtiğinde sunucuyu okundu olarak işaretle",
+        set_activeFrom: "Otomatik okuma başlangıcı",
+        set_activeTo: "Otomatik okuma bitişi",
+        note_activeHours: "Aralık, sessize alınan sunucular ve başlangıç için geçerlidir. Aynı saat veya \"Herhangi bir saat\" her zaman demektir.",
+        hours_any: "Herhangi bir saat",
+        set_clearHotkey: "Bahsetmeleri temizleme kısayolu",
+        context_clear_all: "Tüm bahsetmeler",
+        context_clear_server: "Bu sunucudaki bahsetmeler",
+        context_clear_old: "Bir günden eski bahsetmeler",
+        settings_stats: "İstatistikler",
+        stats_text: "Okundu olarak işaretlenen: {servers} sunucu, {dms} doğrudan mesaj · Temizlenen bahsetmeler: {mentions}",
+        button_reset: "Sıfırla",
+        toast_noMentions: "Eşleşen bahsetme yok",
     },
     uk: {
         context_unreadguilds: "Непрочитані сервери",
@@ -2596,7 +3509,6 @@ const labels = {
         settings_extras: "Додатково",
         settings_blacklist: "Чорний список серверів",
         set_addClearButton: "Додає у вікно згадок кнопку, що видаляє всі згадки",
-        set_confirmClear: "Запитувати підтвердження перед позначенням або видаленням",
         set_guilds: "Непрочитані сервери",
         set_muted: "Приглушені сервери",
         set_dms: "Особисті повідомлення зі згадками",
@@ -2634,6 +3546,34 @@ const labels = {
         channels_none: "Немає",
         button_clear: "Видалити всі",
         tooltip_more: "+{n} ще",
+        set_confirm: "Питати перед позначенням або очищенням",
+        confirm_never: "Ніколи",
+        confirm_always: "Завжди",
+        confirm_from: "Від {n} за раз",
+        set_clearMarksRead: "Очищення згадок також позначає їхні канали прочитаними",
+        set_checkUpdates: "Перевіряти оновлення",
+        note_checkUpdates: "Шукає нову версію на GitHub і пропонує встановити її одним клацанням.",
+        notice_update: "Доступна версія ReadAllNotificationsButtonv2 {version}.",
+        button_update: "Оновити",
+        toast_updated: "Оновлено до {version}",
+        toast_updateFailed: "Не вдалося оновити: {error}",
+        set_buttonStyle: "Вигляд кнопки",
+        style_text: "Текст",
+        style_icon: "Значок",
+        style_both: "Значок і текст",
+        set_readOnLeave: "Позначати сервер прочитаним під час переходу на інший",
+        set_activeFrom: "Автоматичне читання з",
+        set_activeTo: "Автоматичне читання до",
+        note_activeHours: "Діє для інтервалу, приглушених серверів і запуску. Однакова година або «Будь-коли» означає завжди.",
+        hours_any: "Будь-коли",
+        set_clearHotkey: "Комбінація клавіш для очищення згадок",
+        context_clear_all: "Усі згадки",
+        context_clear_server: "Згадки з цього сервера",
+        context_clear_old: "Згадки, старші за один день",
+        settings_stats: "Статистика",
+        stats_text: "Позначено прочитаним: серверів {servers}, особистих повідомлень {dms} · Видалено згадок: {mentions}",
+        button_reset: "Скинути",
+        toast_noMentions: "Немає відповідних згадок",
     },
     vi: {
         context_unreadguilds: "Máy chủ chưa đọc",
@@ -2660,7 +3600,6 @@ const labels = {
         settings_extras: "Tiện ích thêm",
         settings_blacklist: "Danh sách đen máy chủ",
         set_addClearButton: "Thêm nút vào cửa sổ lượt nhắc để xóa tất cả lượt nhắc",
-        set_confirmClear: "Hỏi xác nhận trước khi đánh dấu hoặc xóa",
         set_guilds: "Máy chủ chưa đọc",
         set_muted: "Máy chủ đã tắt tiếng",
         set_dms: "Tin nhắn trực tiếp có lượt nhắc",
@@ -2698,6 +3637,34 @@ const labels = {
         channels_none: "Không có",
         button_clear: "Xóa tất cả",
         tooltip_more: "+{n} khác",
+        set_confirm: "Hỏi trước khi đánh dấu hoặc xóa",
+        confirm_never: "Không bao giờ",
+        confirm_always: "Luôn luôn",
+        confirm_from: "Từ {n} mục trở lên cùng lúc",
+        set_clearMarksRead: "Xóa lượt nhắc cũng đánh dấu kênh của chúng là đã đọc",
+        set_checkUpdates: "Kiểm tra cập nhật",
+        note_checkUpdates: "Tìm phiên bản mới trên GitHub và đề nghị cài đặt chỉ với một cú nhấp.",
+        notice_update: "ReadAllNotificationsButtonv2 {version} đã có.",
+        button_update: "Cập nhật",
+        toast_updated: "Đã cập nhật lên {version}",
+        toast_updateFailed: "Cập nhật thất bại: {error}",
+        set_buttonStyle: "Kiểu nút",
+        style_text: "Văn bản",
+        style_icon: "Biểu tượng",
+        style_both: "Biểu tượng và văn bản",
+        set_readOnLeave: "Đánh dấu máy chủ là đã đọc khi chuyển sang máy chủ khác",
+        set_activeFrom: "Tự động đọc từ",
+        set_activeTo: "Tự động đọc đến",
+        note_activeHours: "Áp dụng cho khoảng thời gian, máy chủ đã tắt tiếng và lúc khởi động. Cùng giờ hoặc \"Bất kỳ lúc nào\" nghĩa là luôn luôn.",
+        hours_any: "Bất kỳ lúc nào",
+        set_clearHotkey: "Phím tắt để xóa lượt nhắc",
+        context_clear_all: "Tất cả lượt nhắc",
+        context_clear_server: "Lượt nhắc từ máy chủ này",
+        context_clear_old: "Lượt nhắc cũ hơn một ngày",
+        settings_stats: "Thống kê",
+        stats_text: "Đã đánh dấu đã đọc: {servers} máy chủ, {dms} tin nhắn trực tiếp · Đã xóa lượt nhắc: {mentions}",
+        button_reset: "Đặt lại",
+        toast_noMentions: "Không có lượt nhắc phù hợp",
     },
     "zh-CN": {
         context_unreadguilds: "未读服务器",
@@ -2724,7 +3691,6 @@ const labels = {
         settings_extras: "附加功能",
         settings_blacklist: "服务器黑名单",
         set_addClearButton: "在提及窗口中添加一个移除所有提及的按钮",
-        set_confirmClear: "标记或移除前请求确认",
         set_guilds: "未读服务器",
         set_muted: "已静音的服务器",
         set_dms: "有提及的私信",
@@ -2762,6 +3728,34 @@ const labels = {
         channels_none: "无",
         button_clear: "全部移除",
         tooltip_more: "另有 {n} 个",
+        set_confirm: "标记或清除前询问",
+        confirm_never: "从不",
+        confirm_always: "总是",
+        confirm_from: "一次 {n} 个及以上时",
+        set_clearMarksRead: "清除提及时也将其频道标记为已读",
+        set_checkUpdates: "检查更新",
+        note_checkUpdates: "在 GitHub 上查找新版本，并提供一键安装。",
+        notice_update: "ReadAllNotificationsButtonv2 {version} 已可用。",
+        button_update: "更新",
+        toast_updated: "已更新到 {version}",
+        toast_updateFailed: "更新失败：{error}",
+        set_buttonStyle: "按钮样式",
+        style_text: "文字",
+        style_icon: "图标",
+        style_both: "图标和文字",
+        set_readOnLeave: "切换到其他服务器时将其标记为已读",
+        set_activeFrom: "自动已读开始时间",
+        set_activeTo: "自动已读结束时间",
+        note_activeHours: "适用于定时、已静音的服务器和启动时。相同的小时或“任意时间”表示始终生效。",
+        hours_any: "任意时间",
+        set_clearHotkey: "清除提及的快捷键",
+        context_clear_all: "所有提及",
+        context_clear_server: "此服务器的提及",
+        context_clear_old: "超过一天的提及",
+        settings_stats: "统计",
+        stats_text: "已标记为已读：{servers} 个服务器，{dms} 个私信 · 已清除提及：{mentions}",
+        button_reset: "重置",
+        toast_noMentions: "没有匹配的提及",
     },
     "zh-TW": {
         context_unreadguilds: "未讀伺服器",
@@ -2788,7 +3782,6 @@ const labels = {
         settings_extras: "附加功能",
         settings_blacklist: "伺服器黑名單",
         set_addClearButton: "在提及視窗中加入一個移除所有提及的按鈕",
-        set_confirmClear: "標示或移除前要求確認",
         set_guilds: "未讀伺服器",
         set_muted: "已靜音的伺服器",
         set_dms: "有提及的私人訊息",
@@ -2826,5 +3819,33 @@ const labels = {
         channels_none: "無",
         button_clear: "全部移除",
         tooltip_more: "另有 {n} 個",
+        set_confirm: "標示或清除前詢問",
+        confirm_never: "永不",
+        confirm_always: "一律",
+        confirm_from: "一次 {n} 個以上時",
+        set_clearMarksRead: "清除提及時也將其頻道標示為已讀",
+        set_checkUpdates: "檢查更新",
+        note_checkUpdates: "在 GitHub 上尋找新版本，並提供一鍵安裝。",
+        notice_update: "ReadAllNotificationsButtonv2 {version} 已推出。",
+        button_update: "更新",
+        toast_updated: "已更新至 {version}",
+        toast_updateFailed: "更新失敗：{error}",
+        set_buttonStyle: "按鈕樣式",
+        style_text: "文字",
+        style_icon: "圖示",
+        style_both: "圖示和文字",
+        set_readOnLeave: "切換到其他伺服器時將其標示為已讀",
+        set_activeFrom: "自動已讀開始時間",
+        set_activeTo: "自動已讀結束時間",
+        note_activeHours: "適用於定時、已靜音的伺服器和啟動時。相同的小時或「任何時間」表示一律生效。",
+        hours_any: "任何時間",
+        set_clearHotkey: "清除提及的快速鍵",
+        context_clear_all: "所有提及",
+        context_clear_server: "此伺服器的提及",
+        context_clear_old: "超過一天的提及",
+        settings_stats: "統計",
+        stats_text: "已標示為已讀：{servers} 個伺服器、{dms} 個私人訊息 · 已清除提及：{mentions}",
+        button_reset: "重設",
+        toast_noMentions: "沒有符合的提及",
     },
 };
