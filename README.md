@@ -58,6 +58,10 @@ Bulgarian, Chinese (Simplified and Traditional), Croatian, Czech, Danish, Dutch,
 
 If you use the original ReadAllNotificationsButton, disable it first, otherwise you get two buttons.
 
+## Support
+
+Questions, bug reports and ideas: [Discord server](https://discord.gg/bQeNQPHVcR) or [GitHub issues](https://github.com/uwemanfred64-png/ReadAllNotificationsButtonv2/issues).
+
 ## License
 
 [MIT](LICENSE)

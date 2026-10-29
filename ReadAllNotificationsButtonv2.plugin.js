@@ -2,7 +2,8 @@
  * @name ReadAllNotificationsButtonv2
  * @author uwemanfred64-png
  * @description Adds a "read all" button to the server list that marks every notification as read at once, and a button to the mentions popout that clears all mentions. Includes a counter, Shift+click to read everything, middle click for the current server, a keybind, folders in the context menu, a server black list, timed and automatic reading, reading only older messages, keeping channels with mentions unread, excluded channels and 30 selectable languages. No library needed.
- * @version 2.1.0
+ * @version 2.1.1
+ * @invite bQeNQPHVcR
  * @source https://github.com/uwemanfred64-png/ReadAllNotificationsButtonv2
  * @website https://github.com/uwemanfred64-png/ReadAllNotificationsButtonv2
  * @updateUrl https://raw.githubusercontent.com/uwemanfred64-png/ReadAllNotificationsButtonv2/main/ReadAllNotificationsButtonv2.plugin.js
